@@ -14,11 +14,9 @@ jobs:
         uses: actions/checkout@v3
 
       - name: ServiceNow CI/CD Apply Changes
-        uses: ServiceNow/servicenow-cicd-apply-changes@v2
+        uses: ServiceNow/sncicd-apply-changes@v2
         with:
           instance: ${{ secrets.SN_INSTANCE }}
           username: ${{ secrets.SN_USERNAME }}
           password: ${{ secrets.SN_PASSWORD }}
           app_scope: x_1841701_github_1
-          app_version: ''
-          base_app_version: ''
