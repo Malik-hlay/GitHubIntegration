@@ -1,0 +1,22 @@
+name: ServiceNow CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - sn_instances/dev384001
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: ServiceNow CI/CD Apply Changes
+        uses: ServiceNow/sncicd-apply-changes@2.0.0
+        env:
+          nowUsername: ${{ secrets.SN_USERNAME }}
+          nowPassword: ${{ secrets.SN_PASSWORD }}
+          nowSourceInstance: ${{ secrets.SN_INSTANCE }}
+          appScope: x_1841701_github_1
