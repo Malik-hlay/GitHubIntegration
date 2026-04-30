@@ -15,7 +15,7 @@ BidirectionalTest.prototype = {
     },
 
     type: 'BidirectionalTest'
-}; //Test from ServiceNow to GitHub]]>  //Test from Github to ServiceNow]]> </script>
+}; //Test from ServiceNow to GitHub]]></script>
         <sys_class_name>sys_script_include</sys_class_name>
         <sys_created_by>admin</sys_created_by>
         <sys_created_on>2026-04-30 23:02:35</sys_created_on>
