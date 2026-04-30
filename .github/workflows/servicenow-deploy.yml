@@ -20,3 +20,4 @@ jobs:
           nowPassword: ${{ secrets.SN_PASSWORD }}
           nowSourceInstance: ${{ secrets.SN_INSTANCE }}
           appScope: x_1841701_github_1
+          branch: sn_instances/dev384001
