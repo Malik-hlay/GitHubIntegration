@@ -1,0 +1,2949 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_ui_page">
+    <sys_ui_page action="DELETE">
+        <category>general</category>
+        <client_script><![CDATA[// =============================================================================
+// Incident Agent Cockpit — UI Page client script.
+// Vanilla JS, no jQuery. Mirrors the existing Flight Deck conventions.
+// =============================================================================
+
+var IAC = {
+    scope: 'mine',
+    sort: 'urgency',
+    filters: {
+        priority: [],
+        state: [],
+        has_blockers: false,
+        awaiting: false
+    },
+    rows: [],
+    selectedSysId: '',
+    checkedSysIds: {},
+    refreshTimer: null,
+    refreshIntervalMs: 60000
+};
+
+function acById(id) {
+    return document.getElementById(id);
+}
+
+function acEscape(value) {
+    if (value === null || value === undefined)
+        return '';
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function acShowMessage(type, text) {
+    var el = acById('ac-message');
+    if (!el) return;
+    el.className = 'ac-message ' + type;
+    el.style.display = 'block';
+    el.textContent = text || '';
+}
+
+function acClearMessage() {
+    var el = acById('ac-message');
+    if (!el) return;
+    el.className = 'ac-message';
+    el.style.display = 'none';
+    el.textContent = '';
+}
+
+function acPriorityClass(text) {
+    var p = String(text || '');
+    if (p.indexOf('1') === 0) return 'ac-badge ac-badge-priority-1';
+    if (p.indexOf('2') === 0) return 'ac-badge ac-badge-priority-2';
+    if (p.indexOf('3') === 0) return 'ac-badge ac-badge-priority-3';
+    return 'ac-badge ac-badge-priority-4';
+}
+
+function acStateClass(text) {
+    var s = String(text || '');
+    if (s === 'New') return 'ac-badge ac-badge-state-new';
+    if (s === 'In Progress') return 'ac-badge ac-badge-state-progress';
+    if (s === 'On Hold') return 'ac-badge ac-badge-state-hold';
+    if (s === 'Resolved') return 'ac-badge ac-badge-state-resolved';
+    if (s === 'Closed') return 'ac-badge ac-badge-state-closed';
+    return 'ac-badge ac-badge-neutral';
+}
+
+function acSlaClass(status) {
+    if (status === 'bad') return 'ac-badge ac-badge-sla-bad';
+    if (status === 'warn') return 'ac-badge ac-badge-sla-warn';
+    if (status === 'ok') return 'ac-badge ac-badge-sla-ok';
+    return 'ac-badge ac-badge-neutral';
+}
+
+function acClampPercent(n) {
+    var v = parseInt(n, 10) || 0;
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    return v;
+}
+
+function acFormatAge(minutes) {
+    var m = parseInt(minutes, 10) || 0;
+    if (m < 60) return m + 'm';
+    if (m < 60 * 24) return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+    return Math.floor(m / (60 * 24)) + 'd ' + Math.floor((m % (60 * 24)) / 60) + 'h';
+}
+
+// =============================================================================
+// AJAX wrapper — mirrors fdAjax pattern.
+// =============================================================================
+
+function acAjax(methodName, params, callback) {
+    var ga = new GlideAjax('IncidentAgentCockpitAjax');
+    ga.addParam('sysparm_name', methodName);
+
+    if (params) {
+        for (var key in params) {
+            if (params.hasOwnProperty(key))
+                ga.addParam('sysparm_' + key, params[key]);
+        }
+    }
+
+    ga.getXMLAnswer(function(answer) {
+        var payload = {};
+        try {
+            payload = JSON.parse(answer || '{}');
+        } catch (e) {
+            acShowMessage('error', 'Could not parse server response: ' + e.message);
+            return;
+        }
+        callback(payload || {});
+    });
+}
+
+// =============================================================================
+// Queue load + render
+// =============================================================================
+
+function acLoadQueue(silent) {
+    if (!silent)
+        acShowMessage('info', 'Loading queue...');
+
+    acAjax('loadQueue', {
+        scope: IAC.scope,
+        sort: IAC.sort,
+        filters: JSON.stringify(IAC.filters)
+    }, function(payload) {
+        if (!payload || !payload.ok) {
+            acShowMessage('error', (payload && payload.message) || 'Could not load queue.');
+            return;
+        }
+
+        IAC.rows = payload.rows || [];
+        acRenderHeader(payload);
+        acRenderPulse(payload.pulse || {});
+        acRenderStrip(IAC.rows);
+        acRenderShiftPulse(payload, IAC.rows);
+        acClearMessage();
+    });
+}
+
+function acRenderHeader(payload) {
+    var name = (payload.user || {}).name || 'agent';
+    acById('ac-greeting').textContent = 'Cockpit — ' + name;
+    acById('ac-subline').textContent = 'Showing ' + (payload.rows || []).length + ' incidents · scope: ' + acScopeLabel(payload.scope) + ' · loaded ' + (payload.shift_started || '');
+
+    var btns = document.querySelectorAll('.ac-scope-btn');
+    var i;
+    for (i = 0; i < btns.length; i++) {
+        if (btns[i].getAttribute('data-scope') === IAC.scope)
+            btns[i].classList.add('active');
+        else
+            btns[i].classList.remove('active');
+    }
+}
+
+function acScopeLabel(s) {
+    if (s === 'group') return 'My group';
+    if (s === 'watch') return 'Watchlist';
+    return 'My incidents';
+}
+
+function acRenderPulse(pulse) {
+    acById('ac-pulse-total').textContent = pulse.total || 0;
+    acById('ac-pulse-at-risk').textContent = pulse.at_risk || 0;
+    acById('ac-pulse-awaiting').textContent = pulse.awaiting_customer || 0;
+    acById('ac-pulse-sla').textContent = pulse.sla_breach || 0;
+    acById('ac-pulse-stale').textContent = pulse.stale || 0;
+}
+
+function acRenderStrip(rows) {
+    var host = acById('ac-strip');
+    if (!host) return;
+
+    if (!rows.length) {
+        host.innerHTML = '<div class="ac-empty">No incidents match the current scope and filters.</div>';
+        return;
+    }
+
+    var html = [];
+    var i;
+    for (i = 0; i < rows.length; i++)
+        html.push(acRowHtml(rows[i]));
+
+    host.innerHTML = html.join('');
+}
+
+function acRowHtml(row) {
+    var checked = IAC.checkedSysIds[row.sys_id] ? ' checked="checked"' : '';
+    var selectedCls = (IAC.selectedSysId === row.sys_id) ? ' selected' : '';
+    var scores = row.lite_scores || {};
+    var chip = row.next_action_chip || { label: '', tone: 'neutral' };
+
+    return '' +
+        '<div class="ac-row' + selectedCls + '" data-sys-id="' + acEscape(row.sys_id) + '">' +
+            '<input type="checkbox" class="ac-row-check" data-row-check="' + acEscape(row.sys_id) + '"' + checked + ' />' +
+            '<div class="ac-row-id">' +
+                '<span class="ac-row-number">' + acEscape(row.number) + '</span>' +
+                '<div class="ac-row-badges">' +
+                    '<span class="' + acPriorityClass(row.priority) + '">' + acEscape(row.priority || 'P?') + '</span>' +
+                    '<span class="' + acStateClass(row.state) + '">' + acEscape(row.state || '—') + '</span>' +
+                '</div>' +
+            '</div>' +
+            '<div class="ac-row-title" title="' + acEscape(row.short_description) + '">' + acEscape(row.short_description || '(no short description)') + '</div>' +
+            '<div class="ac-row-bars">' +
+                acBar('readiness', scores.readiness) +
+                acBar('risk', scores.risk) +
+                acBar('dup', scores.dup) +
+                acBar('escalation', scores.escalation) +
+            '</div>' +
+            '<div class="ac-row-meta">' +
+                '<span class="ac-chip ac-chip-tone-' + acEscape(chip.tone) + '" style="cursor:default;">' + acEscape(chip.label || '—') + '</span>' +
+                '<span class="' + acSlaClass((row.sla || {}).status) + '">' + acEscape((row.sla || {}).label || 'No SLA') + '</span>' +
+                '<span>Activity: <strong>' + acFormatAge(row.last_activity_minutes) + '</strong> ago</span>' +
+            '</div>' +
+            '<div class="ac-row-actions">' +
+                '<button class="ac-icon-btn" type="button" data-row-action="open" data-sys-id="' + acEscape(row.sys_id) + '">Flight Deck</button>' +
+                '<button class="ac-icon-btn" type="button" data-row-action="quicknote" data-sys-id="' + acEscape(row.sys_id) + '">Note</button>' +
+            '</div>' +
+        '</div>';
+}
+
+function acBar(kind, value) {
+    var pct = acClampPercent(value);
+    return '<div class="ac-bar bar-' + kind + '" title="' + kind + ': ' + pct + '">' +
+        '<div class="ac-bar-fill" style="width:' + pct + '%;"></div>' +
+        '<div class="ac-bar-label">' + pct + '</div>' +
+    '</div>';
+}
+
+function acRenderShiftPulse(payload, rows) {
+    var stale = 0;
+    var oldestStaleMin = 0;
+    var i;
+    for (i = 0; i < rows.length; i++) {
+        if ((rows[i].last_activity_minutes || 0) >= 240) {
+            stale++;
+            if (rows[i].last_activity_minutes > oldestStaleMin)
+                oldestStaleMin = rows[i].last_activity_minutes;
+        }
+    }
+    var msg = rows.length + ' in queue · ' + stale + ' stale';
+    if (oldestStaleMin > 0)
+        msg += ' · oldest untouched: ' + acFormatAge(oldestStaleMin);
+    acById('ac-shiftpulse').textContent = msg;
+}
+
+// =============================================================================
+// Focus lane
+// =============================================================================
+
+function acSelectRow(sysId) {
+    IAC.selectedSysId = sysId;
+
+    var rows = document.querySelectorAll('.ac-row');
+    var i;
+    for (i = 0; i < rows.length; i++) {
+        if (rows[i].getAttribute('data-sys-id') === sysId)
+            rows[i].classList.add('selected');
+        else
+            rows[i].classList.remove('selected');
+    }
+
+    acAjax('getFocus', { sys_id: sysId }, function(payload) {
+        if (!payload || !payload.ok) {
+            acRenderFocusEmpty((payload && payload.message) || 'Could not load incident.');
+            return;
+        }
+        acRenderFocus(payload);
+    });
+}
+
+function acRenderFocusEmpty(msg) {
+    var host = acById('ac-focus');
+    host.innerHTML = '<div class="ac-focus-empty"><strong>' + acEscape(msg || 'No incident selected.') + '</strong></div>';
+}
+
+function acRenderFocus(p) {
+    var host = acById('ac-focus');
+    var summary = p.summary || {};
+    var metrics = p.metrics || {};
+    var nba = p.next_action || {};
+    var fixCards = p.fix_cards || [];
+    var sla = p.sla || {};
+    var lj = p.last_journal || {};
+
+    var html = '';
+    html += '<h3 class="ac-focus-title">' + acEscape(p.number || 'Incident') + '</h3>';
+    html += '<div class="ac-focus-subtitle">' + acEscape(p.short_description || '') + '</div>';
+
+    html += '<div class="ac-hero-actions" style="display:flex; gap:6px; margin-bottom:6px;">';
+    html += '<button class="ac-btn secondary" type="button" data-row-action="open" data-sys-id="' + acEscape(p.sys_id) + '">Open in Flight Deck</button>';
+    html += '</div>';
+
+    html += '<div class="ac-focus-section"><h4>Snapshot</h4><div class="ac-kv-grid">';
+    html += acKv('Caller', summary.caller);
+    html += acKv('Group', summary.assignment_group);
+    html += acKv('Assigned to', summary.assigned_to);
+    html += acKv('CI', summary.ci);
+    html += acKv('Category', summary.category);
+    html += acKv('Impact / Urgency', (summary.impact || '—') + ' / ' + (summary.urgency || '—'));
+    html += '</div></div>';
+
+    if (sla && sla.label) {
+        html += '<div class="ac-focus-section"><h4>SLA</h4>';
+        html += '<span class="' + acSlaClass(sla.status) + '">' + acEscape(sla.label) + '</span>';
+        if (sla.detail)
+            html += '<div class="ac-kv-value" style="margin-top:6px;">' + acEscape(sla.detail) + '</div>';
+        html += '</div>';
+    }
+
+    if (nba && nba.title) {
+        html += '<div class="ac-focus-section"><h4>Next best action</h4>';
+        html += '<div class="ac-kv-value"><strong>' + acEscape(nba.title) + '</strong></div>';
+        if (nba.rationale)
+            html += '<div class="ac-fix-detail">' + acEscape(nba.rationale) + '</div>';
+        html += '</div>';
+    }
+
+    if (fixCards.length) {
+        html += '<div class="ac-focus-section"><h4>Top fix cards</h4>';
+        var i;
+        for (i = 0; i < fixCards.length; i++) {
+            var fc = fixCards[i] || {};
+            var tone = fc.severity || fc.tone || 'info';
+            html += '<div class="ac-fix-card tone-' + acEscape(tone) + '">';
+            html += '<div class="ac-fix-title">' + acEscape(fc.title || fc.label || 'Action') + '</div>';
+            if (fc.detail || fc.description)
+                html += '<div class="ac-fix-detail">' + acEscape(fc.detail || fc.description) + '</div>';
+            html += '</div>';
+        }
+        html += '</div>';
+    }
+
+    if (metrics && (metrics.readiness || metrics.reopen_risk || metrics.duplicate_confidence || metrics.escalation_probability)) {
+        html += '<div class="ac-focus-section"><h4>Metrics</h4><div class="ac-kv-grid">';
+        html += acKv('Readiness', acMetricVal(metrics.readiness));
+        html += acKv('Reopen risk', acMetricVal(metrics.reopen_risk));
+        html += acKv('Duplicate', acMetricVal(metrics.duplicate_confidence));
+        html += acKv('Escalation', acMetricVal(metrics.escalation_probability));
+        html += '</div></div>';
+    }
+
+    if (lj && lj.text) {
+        html += '<div class="ac-focus-section"><h4>Last journal entry</h4>';
+        html += '<div class="ac-kv-label">' + acEscape(lj.author || '') + ' · ' + acEscape(lj.when || '') + '</div>';
+        html += '<div class="ac-kv-value" style="white-space:pre-wrap;">' + acEscape(lj.text) + '</div>';
+        html += '</div>';
+    }
+
+    html += '<div class="ac-focus-section"><h4>Quick work note</h4>';
+    html += '<div class="ac-quick-form">';
+    html += '<textarea id="ac-focus-note" placeholder="Add a quick work note..."></textarea>';
+    html += '<button class="ac-btn" type="button" id="ac-focus-note-btn" data-sys-id="' + acEscape(p.sys_id) + '">Save note</button>';
+    html += '</div></div>';
+
+    host.innerHTML = html;
+
+    var btn = acById('ac-focus-note-btn');
+    if (btn) {
+        btn.onclick = function() {
+            var ta = acById('ac-focus-note');
+            var note = (ta && ta.value) || '';
+            if (!note) {
+                acShowMessage('error', 'Note cannot be empty.');
+                return;
+            }
+            acAjax('quickUpdate', { sys_id: p.sys_id, note: note }, function(resp) {
+                if (resp && resp.ok) {
+                    acShowMessage('success', 'Work note added to ' + p.number + '.');
+                    if (ta) ta.value = '';
+                } else {
+                    acShowMessage('error', (resp && resp.message) || 'Could not save note.');
+                }
+            });
+        };
+    }
+}
+
+function acMetricVal(m) {
+    if (!m) return '—';
+    if (typeof m === 'object' && m !== null) {
+        if (typeof m.value !== 'undefined') return m.value + (m.unit || '');
+        if (typeof m.percent !== 'undefined') return m.percent + '%';
+    }
+    return String(m);
+}
+
+function acKv(label, value) {
+    return '<div><div class="ac-kv-label">' + acEscape(label) + '</div><div class="ac-kv-value">' + acEscape(value || '—') + '</div></div>';
+}
+
+// =============================================================================
+// Bulk tray
+// =============================================================================
+
+function acRefreshBulkTray() {
+    var ids = acCheckedIds();
+    var tray = acById('ac-bulk');
+    var count = acById('ac-bulk-count');
+    if (!tray || !count) return;
+
+    if (ids.length) {
+        tray.style.display = 'flex';
+        count.textContent = ids.length + ' selected';
+        acPauseAutoRefresh();
+    } else {
+        tray.style.display = 'none';
+        acResumeAutoRefresh();
+    }
+}
+
+function acCheckedIds() {
+    var out = [];
+    var k;
+    for (k in IAC.checkedSysIds) {
+        if (IAC.checkedSysIds.hasOwnProperty(k) && IAC.checkedSysIds[k])
+            out.push(k);
+    }
+    return out;
+}
+
+function acClearChecks() {
+    IAC.checkedSysIds = {};
+    var boxes = document.querySelectorAll('.ac-row-check');
+    var i;
+    for (i = 0; i < boxes.length; i++)
+        boxes[i].checked = false;
+    acRefreshBulkTray();
+}
+
+function acBulk(method, params, successMsg) {
+    var ids = acCheckedIds();
+    if (!ids.length) {
+        acShowMessage('error', 'No incidents selected.');
+        return;
+    }
+    var p = { sys_ids: ids.join(',') };
+    var k;
+    for (k in (params || {})) {
+        if (params.hasOwnProperty(k))
+            p[k] = params[k];
+    }
+    acShowMessage('info', 'Applying bulk action...');
+    acAjax(method, p, function(resp) {
+        if (!resp) {
+            acShowMessage('error', 'Bulk action failed.');
+            return;
+        }
+        if (resp.ok)
+            acShowMessage('success', (successMsg || 'Bulk action applied.') + ' ' + (resp.message || ''));
+        else
+            acShowMessage('error', resp.message || 'Bulk action failed.');
+        acClearChecks();
+        acLoadQueue(true);
+    });
+}
+
+// =============================================================================
+// Filters
+// =============================================================================
+
+function acToggleFilterArr(arr, value) {
+    var i = arr.indexOf(value);
+    if (i >= 0) arr.splice(i, 1);
+    else arr.push(value);
+    return arr;
+}
+
+function acReflectFilterChips() {
+    var chips = document.querySelectorAll('.ac-chip');
+    var i;
+    for (i = 0; i < chips.length; i++) {
+        var chip = chips[i];
+        var pri = chip.getAttribute('data-filter-priority');
+        var st = chip.getAttribute('data-filter-state');
+        var fl = chip.getAttribute('data-filter-flag');
+        var active = false;
+        if (pri && IAC.filters.priority.indexOf(pri) >= 0) active = true;
+        if (st && IAC.filters.state.indexOf(st) >= 0) active = true;
+        if (fl === 'has_blockers' && IAC.filters.has_blockers) active = true;
+        if (fl === 'awaiting' && IAC.filters.awaiting) active = true;
+        if (active) chip.classList.add('active');
+        else chip.classList.remove('active');
+    }
+}
+
+function acClearFilters() {
+    IAC.filters = { priority: [], state: [], has_blockers: false, awaiting: false };
+    acReflectFilterChips();
+    acLoadQueue();
+}
+
+// =============================================================================
+// Auto-refresh
+// =============================================================================
+
+function acStartAutoRefresh() {
+    acStopAutoRefresh();
+    IAC.refreshTimer = setInterval(function() {
+        if (IAC.selectedSysId) return;          // pause if a row is open in focus
+        if (acCheckedIds().length) return;      // pause if bulk tray is open
+        acLoadQueue(true);
+    }, IAC.refreshIntervalMs);
+}
+
+function acStopAutoRefresh() {
+    if (IAC.refreshTimer) {
+        clearInterval(IAC.refreshTimer);
+        IAC.refreshTimer = null;
+    }
+}
+
+function acPauseAutoRefresh() { /* keep timer alive but the guards in acStartAutoRefresh skip ticks */ }
+function acResumeAutoRefresh() { /* same — no-op; here for readability */ }
+
+// =============================================================================
+// Event delegation
+// =============================================================================
+
+function acHandleClick(evt) {
+    var node = evt.target || evt.srcElement;
+    var rowAction = '';
+    var scope = '';
+    var pulse = '';
+    var rowSysId = '';
+
+    // Let the change handler deal with checkbox clicks — don't open focus lane.
+    if (node && (node.tagName === 'INPUT' || node.tagName === 'TEXTAREA' || node.tagName === 'SELECT'))
+        return;
+
+    while (node && node !== document) {
+        if (node.getAttribute) {
+            rowAction = node.getAttribute('data-row-action');
+            scope = node.getAttribute('data-scope');
+            pulse = node.getAttribute('data-pulse');
+            if (!rowSysId)
+                rowSysId = node.getAttribute('data-sys-id');
+        }
+        if (rowAction || scope || pulse) break;
+        node = node.parentNode;
+    }
+
+    // Scope toggle
+    if (scope) {
+        evt.preventDefault();
+        IAC.scope = scope;
+        IAC.selectedSysId = '';
+        acRenderFocusEmpty('No incident selected.');
+        acClearChecks();
+        acLoadQueue();
+        return;
+    }
+
+    // Pulse-tile filter shortcuts
+    if (pulse) {
+        evt.preventDefault();
+        if (pulse === 'sla_breach') { IAC.filters = { priority: [], state: [], has_blockers: false, awaiting: false }; }
+        else if (pulse === 'awaiting_customer') { IAC.filters.awaiting = true; }
+        else if (pulse === 'at_risk') { IAC.sort = 'urgency'; var ss = acById('ac-sort-select'); if (ss) ss.value = 'urgency'; }
+        else if (pulse === 'stale') { IAC.sort = 'last_activity'; var ss2 = acById('ac-sort-select'); if (ss2) ss2.value = 'last_activity'; }
+        acReflectFilterChips();
+        acLoadQueue();
+        return;
+    }
+
+    // Per-row actions
+    if (rowAction === 'open' && rowSysId) {
+        evt.preventDefault();
+        window.open('incident_flight_deck.do?incident_sys_id=' + encodeURIComponent(rowSysId), '_blank');
+        return;
+    }
+
+    if (rowAction === 'quicknote' && rowSysId) {
+        evt.preventDefault();
+        var note = window.prompt('Quick work note for selected incident:');
+        if (note) {
+            acAjax('quickUpdate', { sys_id: rowSysId, note: note }, function(resp) {
+                if (resp && resp.ok)
+                    acShowMessage('success', 'Work note added.');
+                else
+                    acShowMessage('error', (resp && resp.message) || 'Could not save note.');
+            });
+        }
+        return;
+    }
+
+    // Filter chip
+    var chipNode = evt.target || evt.srcElement;
+    while (chipNode && chipNode !== document) {
+        if (chipNode.classList && chipNode.classList.contains('ac-chip')) break;
+        chipNode = chipNode.parentNode;
+    }
+    if (chipNode && chipNode !== document && chipNode.classList && chipNode.classList.contains('ac-chip')) {
+        if (chipNode.id === 'ac-clear-filters') {
+            acClearFilters();
+            return;
+        }
+        var pri = chipNode.getAttribute('data-filter-priority');
+        var st = chipNode.getAttribute('data-filter-state');
+        var fl = chipNode.getAttribute('data-filter-flag');
+        if (pri) acToggleFilterArr(IAC.filters.priority, pri);
+        if (st) acToggleFilterArr(IAC.filters.state, st);
+        if (fl === 'has_blockers') IAC.filters.has_blockers = !IAC.filters.has_blockers;
+        if (fl === 'awaiting') IAC.filters.awaiting = !IAC.filters.awaiting;
+        acReflectFilterChips();
+        acLoadQueue();
+        return;
+    }
+
+    // Click on a row (not a button) -> select for focus lane
+    var rowNode = evt.target || evt.srcElement;
+    while (rowNode && rowNode !== document) {
+        if (rowNode.classList && rowNode.classList.contains('ac-row')) break;
+        rowNode = rowNode.parentNode;
+    }
+    if (rowNode && rowNode !== document && rowNode.classList && rowNode.classList.contains('ac-row')) {
+        var sysId = rowNode.getAttribute('data-sys-id');
+        if (sysId) acSelectRow(sysId);
+    }
+}
+
+function acHandleChange(evt) {
+    var t = evt.target || evt.srcElement;
+    if (!t) return;
+
+    if (t.id === 'ac-sort-select') {
+        IAC.sort = t.value || 'urgency';
+        acLoadQueue();
+        return;
+    }
+
+    var rowCheck = t.getAttribute && t.getAttribute('data-row-check');
+    if (rowCheck) {
+        IAC.checkedSysIds[rowCheck] = !!t.checked;
+        acRefreshBulkTray();
+    }
+}
+
+function acBindEvents() {
+    document.addEventListener('click', acHandleClick);
+    document.addEventListener('change', acHandleChange);
+
+    var refresh = acById('ac-refresh-btn');
+    if (refresh) refresh.onclick = function() { acLoadQueue(); };
+
+    var openFlight = acById('ac-open-flightdeck');
+    if (openFlight) openFlight.onclick = function() {
+        if (IAC.selectedSysId)
+            window.open('incident_flight_deck.do?incident_sys_id=' + encodeURIComponent(IAC.selectedSysId), '_blank');
+        else
+            acShowMessage('info', 'Select an incident row first to open it in the Flight Deck.');
+    };
+
+    var ack = acById('ac-bulk-ack');
+    if (ack) ack.onclick = function() {
+        var note = (acById('ac-bulk-note') || {}).value || '';
+        acBulk('bulkAck', { note: note }, 'Acknowledged.');
+    };
+
+    var transition = acById('ac-bulk-transition');
+    if (transition) transition.onclick = function() {
+        var state = (acById('ac-bulk-state') || {}).value || '';
+        var note = (acById('ac-bulk-note') || {}).value || '';
+        if (!state) {
+            acShowMessage('error', 'Pick a transition target first.');
+            return;
+        }
+        acBulk('bulkTransition', { state: state, note: note }, 'State updated.');
+    };
+
+    var reassign = acById('ac-bulk-reassign');
+    if (reassign) reassign.onclick = function() {
+        var group = (acById('ac-bulk-group') || {}).value || '';
+        var note = (acById('ac-bulk-note') || {}).value || '';
+        if (!group) {
+            acShowMessage('error', 'Group sys_id is required for reassign.');
+            return;
+        }
+        acBulk('bulkReassign', { group: group, note: note }, 'Reassigned.');
+    };
+
+    var cancel = acById('ac-bulk-cancel');
+    if (cancel) cancel.onclick = function() { acClearChecks(); };
+}
+
+function initIncidentAgentCockpit() {
+    var holder = acById('ac-initial-scope');
+    IAC.scope = holder ? (holder.value || 'mine') : 'mine';
+
+    acBindEvents();
+    acReflectFilterChips();
+    acLoadQueue();
+    acStartAutoRefresh();
+}
+
+if (typeof addLoadEvent === 'function')
+    addLoadEvent(initIncidentAgentCockpit);
+else if (window.addEventListener)
+    window.addEventListener('load', initIncidentAgentCockpit);
+else
+    window.onload = initIncidentAgentCockpit;]]></client_script>
+        <description/>
+        <direct>false</direct>
+        <endpoint>x_1841701_github_1_incident_agent_cockpit.do</endpoint>
+        <html><![CDATA[<?xml version="1.0" encoding="utf-8"?>
+<j:jelly trim="false" xmlns:j="jelly:core" xmlns:g="glide">
+
+    <g:evaluate var="jvar_initial_scope" expression="RP.getParameterValue('scope') || 'mine'" />
+
+    <html>
+    <head>
+        <title>Incident Agent Cockpit</title>
+        <style>
+            * {
+                box-sizing: border-box;
+            }
+
+            body {
+                margin: 0;
+                font-family: Arial, sans-serif;
+                background: #f4f7fb;
+                color: #152033;
+            }
+
+            .ac-shell {
+                padding: 18px 20px 96px 20px;
+            }
+
+            /* ===== Hero ===== */
+            .ac-hero {
+                display: grid;
+                grid-template-columns: 1.6fr 1fr;
+                gap: 16px;
+                background: linear-gradient(135deg, #0f172a, #172554 68%, #1d4ed8);
+                color: #ffffff;
+                border-radius: 18px;
+                padding: 18px 22px;
+                box-shadow: 0 14px 36px rgba(15, 23, 42, 0.22);
+                margin-bottom: 14px;
+            }
+
+            .ac-eyebrow {
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 0.16em;
+                font-weight: bold;
+                color: rgba(255, 255, 255, 0.76);
+                margin-bottom: 6px;
+            }
+
+            .ac-title {
+                margin: 0;
+                font-size: 26px;
+                line-height: 1.1;
+                font-weight: 700;
+            }
+
+            .ac-subline {
+                color: rgba(255, 255, 255, 0.86);
+                font-size: 13px;
+                line-height: 1.5;
+                margin-top: 6px;
+            }
+
+            .ac-hero-right {
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+                align-items: flex-end;
+                justify-content: space-between;
+            }
+
+            .ac-scope {
+                display: inline-flex;
+                background: rgba(255, 255, 255, 0.10);
+                border: 1px solid rgba(255, 255, 255, 0.18);
+                border-radius: 999px;
+                padding: 3px;
+            }
+
+            .ac-scope-btn {
+                background: transparent;
+                color: rgba(255, 255, 255, 0.85);
+                border: 0;
+                padding: 7px 14px;
+                border-radius: 999px;
+                font-size: 12px;
+                font-weight: bold;
+                cursor: pointer;
+            }
+
+            .ac-scope-btn.active {
+                background: rgba(255, 255, 255, 0.92);
+                color: #1d4ed8;
+            }
+
+            .ac-hero-actions {
+                display: flex;
+                gap: 8px;
+            }
+
+            .ac-link-btn {
+                display: inline-flex;
+                align-items: center;
+                padding: 9px 12px;
+                border-radius: 10px;
+                text-decoration: none;
+                background: rgba(255, 255, 255, 0.12);
+                color: #ffffff;
+                font-weight: bold;
+                border: 1px solid rgba(255, 255, 255, 0.16);
+                font-size: 12px;
+                cursor: pointer;
+            }
+
+            .ac-link-btn:hover {
+                background: rgba(255, 255, 255, 0.20);
+            }
+
+            /* ===== Pulse tiles ===== */
+            .ac-pulse {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+                gap: 12px;
+                margin-bottom: 14px;
+            }
+
+            .ac-tile {
+                background: #ffffff;
+                border-radius: 14px;
+                padding: 14px 16px;
+                box-shadow: 0 4px 12px rgba(15, 23, 42, 0.06);
+                border: 1px solid #e2e8f0;
+                cursor: pointer;
+                transition: transform 0.08s ease, box-shadow 0.12s ease;
+            }
+
+            .ac-tile:hover {
+                transform: translateY(-1px);
+                box-shadow: 0 8px 18px rgba(15, 23, 42, 0.10);
+            }
+
+            .ac-tile.active {
+                border-color: #1d4ed8;
+                box-shadow: 0 0 0 2px rgba(29, 78, 216, 0.18);
+            }
+
+            .ac-tile-label {
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 0.08em;
+                font-weight: bold;
+                color: #475467;
+                margin-bottom: 6px;
+            }
+
+            .ac-tile-value {
+                font-size: 28px;
+                font-weight: 700;
+                color: #0f172a;
+                line-height: 1;
+            }
+
+            .ac-tile-hint {
+                font-size: 11px;
+                color: #667085;
+                margin-top: 6px;
+            }
+
+            .ac-tile.tile-danger .ac-tile-value { color: #dc2626; }
+            .ac-tile.tile-warn .ac-tile-value { color: #d97706; }
+            .ac-tile.tile-info .ac-tile-value { color: #1d4ed8; }
+
+            /* ===== Sort + filter bar ===== */
+            .ac-sortbar {
+                display: flex;
+                gap: 14px;
+                align-items: center;
+                flex-wrap: wrap;
+                background: #ffffff;
+                border-radius: 14px;
+                padding: 12px 14px;
+                margin-bottom: 14px;
+                border: 1px solid #e2e8f0;
+            }
+
+            .ac-sort-label {
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 0.08em;
+                font-weight: bold;
+                color: #475467;
+            }
+
+            .ac-sort-select {
+                border: 1px solid #cfd8e3;
+                border-radius: 8px;
+                padding: 7px 10px;
+                font-size: 13px;
+                color: #111827;
+                background: #ffffff;
+            }
+
+            .ac-chip-row {
+                display: flex;
+                gap: 6px;
+                flex-wrap: wrap;
+            }
+
+            .ac-chip {
+                display: inline-flex;
+                align-items: center;
+                padding: 5px 11px;
+                border-radius: 999px;
+                background: #eef2ff;
+                color: #1d4ed8;
+                border: 1px solid #c7d2fe;
+                font-size: 12px;
+                font-weight: bold;
+                cursor: pointer;
+                user-select: none;
+            }
+
+            .ac-chip.active {
+                background: #1d4ed8;
+                color: #ffffff;
+            }
+
+            .ac-chip.muted {
+                background: #f1f5f9;
+                color: #475467;
+                border-color: #cbd5e1;
+            }
+
+            /* ===== Main grid ===== */
+            .ac-grid {
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) 360px;
+                gap: 14px;
+            }
+
+            @media (max-width: 1100px) {
+                .ac-grid {
+                    grid-template-columns: 1fr;
+                }
+            }
+
+            /* ===== Strip list ===== */
+            .ac-strip {
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+            }
+
+            .ac-row {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 12px;
+                padding: 10px 14px;
+                display: grid;
+                grid-template-columns: 24px 110px 1fr 220px 160px 110px;
+                gap: 12px;
+                align-items: center;
+                cursor: pointer;
+                transition: border-color 0.1s ease, box-shadow 0.12s ease;
+            }
+
+            .ac-row:hover {
+                border-color: #c7d2fe;
+                box-shadow: 0 4px 14px rgba(15, 23, 42, 0.06);
+            }
+
+            .ac-row.selected {
+                border-color: #1d4ed8;
+                box-shadow: 0 0 0 2px rgba(29, 78, 216, 0.16);
+            }
+
+            @media (max-width: 1100px) {
+                .ac-row {
+                    grid-template-columns: 24px 1fr;
+                    grid-template-areas:
+                        "check id"
+                        "check title"
+                        "check meta";
+                    row-gap: 6px;
+                }
+            }
+
+            .ac-row-check {
+                margin: 0;
+            }
+
+            .ac-row-id {
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+            }
+
+            .ac-row-number {
+                font-weight: bold;
+                font-size: 13px;
+                color: #0f172a;
+            }
+
+            .ac-row-badges {
+                display: flex;
+                gap: 4px;
+                flex-wrap: wrap;
+            }
+
+            .ac-row-title {
+                min-width: 0;
+                color: #111827;
+                font-size: 13px;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+
+            .ac-row-bars {
+                display: grid;
+                grid-template-columns: repeat(4, 1fr);
+                gap: 6px;
+            }
+
+            .ac-bar {
+                position: relative;
+                background: #f1f5f9;
+                border-radius: 6px;
+                height: 22px;
+                overflow: hidden;
+            }
+
+            .ac-bar-fill {
+                position: absolute;
+                inset: 0 auto 0 0;
+                background: #6366f1;
+                border-radius: 6px;
+                opacity: 0.85;
+            }
+
+            .ac-bar.bar-readiness .ac-bar-fill { background: #10b981; }
+            .ac-bar.bar-risk .ac-bar-fill { background: #f59e0b; }
+            .ac-bar.bar-dup .ac-bar-fill { background: #6366f1; }
+            .ac-bar.bar-escalation .ac-bar-fill { background: #ef4444; }
+
+            .ac-bar-label {
+                position: absolute;
+                inset: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 10px;
+                font-weight: bold;
+                color: #0f172a;
+            }
+
+            .ac-row-meta {
+                display: flex;
+                flex-direction: column;
+                font-size: 11px;
+                color: #475467;
+                gap: 2px;
+            }
+
+            .ac-row-meta strong {
+                color: #111827;
+                font-size: 12px;
+            }
+
+            .ac-row-actions {
+                display: flex;
+                gap: 6px;
+                justify-content: flex-end;
+                flex-wrap: wrap;
+            }
+
+            .ac-icon-btn {
+                background: #f1f5f9;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+                padding: 6px 9px;
+                font-size: 11px;
+                font-weight: bold;
+                color: #1d4ed8;
+                cursor: pointer;
+            }
+
+            .ac-icon-btn:hover {
+                background: #e0e7ff;
+            }
+
+            /* ===== Badges (mirror Flight Deck tones) ===== */
+            .ac-badge {
+                display: inline-flex;
+                align-items: center;
+                padding: 3px 8px;
+                border-radius: 999px;
+                font-size: 10px;
+                font-weight: bold;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+            }
+
+            .ac-badge-priority-1 { background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; }
+            .ac-badge-priority-2 { background: #ffedd5; color: #c2410c; border: 1px solid #fed7aa; }
+            .ac-badge-priority-3 { background: #fef9c3; color: #a16207; border: 1px solid #fde68a; }
+            .ac-badge-priority-4 { background: #dbeafe; color: #1d4ed8; border: 1px solid #bfdbfe; }
+            .ac-badge-state-new { background: #dbeafe; color: #1d4ed8; }
+            .ac-badge-state-progress { background: #ccfbf1; color: #0f766e; }
+            .ac-badge-state-hold { background: #fef9c3; color: #a16207; }
+            .ac-badge-state-resolved { background: #dcfce7; color: #166534; }
+            .ac-badge-state-closed { background: #e2e8f0; color: #475467; }
+            .ac-badge-neutral { background: #e2e8f0; color: #475467; }
+            .ac-badge-sla-bad { background: #fee2e2; color: #b91c1c; }
+            .ac-badge-sla-warn { background: #fef3c7; color: #b45309; }
+            .ac-badge-sla-ok { background: #dcfce7; color: #166534; }
+
+            .ac-chip-tone-danger { background: #fee2e2; color: #b91c1c; border-color: #fecaca; }
+            .ac-chip-tone-warn { background: #fef3c7; color: #b45309; border-color: #fde68a; }
+            .ac-chip-tone-info { background: #dbeafe; color: #1d4ed8; border-color: #bfdbfe; }
+            .ac-chip-tone-neutral { background: #e2e8f0; color: #475467; border-color: #cbd5e1; }
+
+            /* ===== Focus lane ===== */
+            .ac-focus {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 14px;
+                padding: 16px;
+                position: sticky;
+                top: 16px;
+                align-self: start;
+                max-height: calc(100vh - 32px);
+                overflow-y: auto;
+            }
+
+            .ac-focus-empty {
+                color: #667085;
+                font-size: 13px;
+                line-height: 1.55;
+            }
+
+            .ac-focus-title {
+                font-size: 16px;
+                font-weight: 700;
+                color: #0f172a;
+                margin: 0 0 4px 0;
+            }
+
+            .ac-focus-subtitle {
+                font-size: 12px;
+                color: #475467;
+                margin-bottom: 12px;
+            }
+
+            .ac-focus-section {
+                margin-top: 14px;
+                padding-top: 14px;
+                border-top: 1px solid #eef2f7;
+            }
+
+            .ac-focus-section h4 {
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 0.08em;
+                color: #475467;
+                margin: 0 0 8px 0;
+            }
+
+            .ac-kv-grid {
+                display: grid;
+                grid-template-columns: repeat(2, 1fr);
+                gap: 8px 12px;
+            }
+
+            .ac-kv-label {
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 0.06em;
+                color: #667085;
+                font-weight: bold;
+            }
+
+            .ac-kv-value {
+                font-size: 12px;
+                color: #111827;
+                margin-top: 2px;
+            }
+
+            .ac-fix-card {
+                background: #f8fafc;
+                border: 1px solid #e2e8f0;
+                border-left: 4px solid #6366f1;
+                border-radius: 10px;
+                padding: 10px 12px;
+                margin-bottom: 8px;
+            }
+
+            .ac-fix-card.tone-high { border-left-color: #ef4444; }
+            .ac-fix-card.tone-medium { border-left-color: #f59e0b; }
+            .ac-fix-card.tone-info { border-left-color: #6366f1; }
+
+            .ac-fix-title {
+                font-size: 12px;
+                font-weight: bold;
+                color: #0f172a;
+            }
+
+            .ac-fix-detail {
+                font-size: 11px;
+                color: #475467;
+                line-height: 1.5;
+                margin-top: 4px;
+            }
+
+            .ac-quick-form {
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                margin-top: 10px;
+            }
+
+            .ac-quick-form textarea {
+                width: 100%;
+                border: 1px solid #cfd8e3;
+                border-radius: 8px;
+                padding: 8px 10px;
+                font-family: Arial, sans-serif;
+                font-size: 12px;
+                min-height: 64px;
+                resize: vertical;
+            }
+
+            .ac-btn {
+                background: #1d4ed8;
+                color: #ffffff;
+                border: 0;
+                border-radius: 10px;
+                padding: 9px 14px;
+                font-size: 12px;
+                font-weight: bold;
+                cursor: pointer;
+            }
+
+            .ac-btn:hover { background: #1e40af; }
+            .ac-btn.secondary { background: #f1f5f9; color: #1d4ed8; border: 1px solid #cbd5e1; }
+            .ac-btn.secondary:hover { background: #e0e7ff; }
+            .ac-btn.danger { background: #dc2626; }
+            .ac-btn.danger:hover { background: #b91c1c; }
+
+            /* ===== Bulk tray ===== */
+            .ac-bulk {
+                position: fixed;
+                left: 20px;
+                right: 20px;
+                bottom: 16px;
+                background: #0f172a;
+                color: #ffffff;
+                border-radius: 14px;
+                padding: 12px 16px;
+                box-shadow: 0 18px 40px rgba(15, 23, 42, 0.30);
+                display: flex;
+                gap: 12px;
+                align-items: center;
+                z-index: 50;
+            }
+
+            .ac-bulk-count {
+                font-size: 13px;
+                font-weight: bold;
+            }
+
+            .ac-bulk select,
+            .ac-bulk input[type="text"] {
+                background: #1e293b;
+                color: #e2e8f0;
+                border: 1px solid #334155;
+                border-radius: 8px;
+                padding: 7px 10px;
+                font-size: 12px;
+            }
+
+            .ac-bulk .ac-btn {
+                background: #1d4ed8;
+            }
+
+            .ac-bulk .ac-btn.secondary {
+                background: transparent;
+                color: #cbd5e1;
+                border: 1px solid #334155;
+            }
+
+            /* ===== Shift pulse ===== */
+            .ac-shiftpulse {
+                margin-top: 16px;
+                padding: 12px 16px;
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 12px;
+                font-size: 12px;
+                color: #475467;
+            }
+
+            /* ===== Message bar ===== */
+            .ac-message {
+                margin-bottom: 12px;
+                padding: 10px 14px;
+                border-radius: 10px;
+                font-size: 13px;
+                display: none;
+            }
+
+            .ac-message.info { background: #dbeafe; color: #1d4ed8; border: 1px solid #bfdbfe; }
+            .ac-message.success { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+            .ac-message.error { background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; }
+
+            .ac-empty {
+                background: #ffffff;
+                border: 1px dashed #cbd5e1;
+                border-radius: 12px;
+                padding: 32px;
+                text-align: center;
+                color: #667085;
+                font-size: 13px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="ac-shell">
+
+            <header class="ac-hero">
+                <div>
+                    <div class="ac-eyebrow">Incident Agent Cockpit</div>
+                    <h1 class="ac-title" id="ac-greeting">Loading your queue...</h1>
+                    <div class="ac-subline" id="ac-subline">Reusing the Flight Deck scoring engine to rank every open incident in your scope.</div>
+                </div>
+                <div class="ac-hero-right">
+                    <div class="ac-scope" role="tablist">
+                        <button class="ac-scope-btn" type="button" data-scope="mine">My incidents</button>
+                        <button class="ac-scope-btn" type="button" data-scope="group">My group</button>
+                        <button class="ac-scope-btn" type="button" data-scope="watch">Watchlist</button>
+                    </div>
+                    <div class="ac-hero-actions">
+                        <button class="ac-link-btn" type="button" id="ac-refresh-btn">Refresh</button>
+                        <a class="ac-link-btn" href="javascript:void(0)" id="ac-open-flightdeck">Open Flight Deck</a>
+                    </div>
+                </div>
+            </header>
+
+            <div id="ac-message" class="ac-message"></div>
+
+            <section class="ac-pulse" id="ac-pulse">
+                <div class="ac-tile" data-pulse="total">
+                    <div class="ac-tile-label">Total open</div>
+                    <div class="ac-tile-value" id="ac-pulse-total">0</div>
+                    <div class="ac-tile-hint">In current scope (capped at 50)</div>
+                </div>
+                <div class="ac-tile tile-danger" data-pulse="at_risk">
+                    <div class="ac-tile-label">At-risk</div>
+                    <div class="ac-tile-value" id="ac-pulse-at-risk">0</div>
+                    <div class="ac-tile-hint">Escalation probability ≥ 65</div>
+                </div>
+                <div class="ac-tile tile-warn" data-pulse="awaiting_customer">
+                    <div class="ac-tile-label">Awaiting</div>
+                    <div class="ac-tile-value" id="ac-pulse-awaiting">0</div>
+                    <div class="ac-tile-hint">On-hold / awaiting input</div>
+                </div>
+                <div class="ac-tile tile-danger" data-pulse="sla_breach">
+                    <div class="ac-tile-label">SLA breach</div>
+                    <div class="ac-tile-value" id="ac-pulse-sla">0</div>
+                    <div class="ac-tile-hint">Already breached active SLA</div>
+                </div>
+                <div class="ac-tile tile-info" data-pulse="stale">
+                    <div class="ac-tile-label">Stale</div>
+                    <div class="ac-tile-value" id="ac-pulse-stale">0</div>
+                    <div class="ac-tile-hint">No update in 4+ hours</div>
+                </div>
+            </section>
+
+            <section class="ac-sortbar">
+                <span class="ac-sort-label">Sort</span>
+                <select class="ac-sort-select" id="ac-sort-select">
+                    <option value="urgency">Urgency score</option>
+                    <option value="sla">SLA breach time</option>
+                    <option value="last_activity">Last activity</option>
+                    <option value="reopen">Reopen risk</option>
+                </select>
+
+                <span class="ac-sort-label">Filter</span>
+                <div class="ac-chip-row">
+                    <span class="ac-chip" data-filter-priority="1">P1</span>
+                    <span class="ac-chip" data-filter-priority="2">P2</span>
+                    <span class="ac-chip" data-filter-priority="3">P3</span>
+                    <span class="ac-chip" data-filter-state="1">New</span>
+                    <span class="ac-chip" data-filter-state="2">In progress</span>
+                    <span class="ac-chip" data-filter-flag="has_blockers">Has blockers</span>
+                    <span class="ac-chip" data-filter-flag="awaiting">Awaiting customer</span>
+                    <span class="ac-chip muted" id="ac-clear-filters">Clear</span>
+                </div>
+            </section>
+
+            <main class="ac-grid">
+                <div class="ac-strip" id="ac-strip">
+                    <div class="ac-empty">Loading queue...</div>
+                </div>
+
+                <aside class="ac-focus" id="ac-focus">
+                    <div class="ac-focus-empty">
+                        <strong>No incident selected.</strong>
+                        <div style="margin-top:6px;">Click any row to see its top fix cards, blockers, and last journal entry — or open the full Flight Deck for a deep dive.</div>
+                    </div>
+                </aside>
+            </main>
+
+            <div class="ac-shiftpulse" id="ac-shiftpulse">
+                Welcome — start with the highest-urgency rows. Stale incidents appear at the bottom of the list and on the Stale tile above.
+            </div>
+        </div>
+
+        <footer class="ac-bulk" id="ac-bulk" style="display:none;">
+            <span class="ac-bulk-count" id="ac-bulk-count">0 selected</span>
+            <input type="text" id="ac-bulk-note" placeholder="Optional note (becomes work_notes)" style="flex:1; min-width:200px;" />
+            <select id="ac-bulk-state">
+                <option value="">— transition —</option>
+                <option value="2">In Progress</option>
+                <option value="3">On Hold</option>
+            </select>
+            <input type="text" id="ac-bulk-group" placeholder="Reassign group sys_id" style="width:200px;" />
+            <button class="ac-btn" type="button" id="ac-bulk-ack">Acknowledge</button>
+            <button class="ac-btn" type="button" id="ac-bulk-transition">Transition</button>
+            <button class="ac-btn" type="button" id="ac-bulk-reassign">Reassign</button>
+            <button class="ac-btn secondary" type="button" id="ac-bulk-cancel">Cancel</button>
+        </footer>
+
+        <input type="hidden" id="ac-initial-scope" value="${jvar_initial_scope}" />
+    </body>
+    </html>
+
+</j:jelly>
+]]></html>
+        <name>incident_agent_cockpit</name>
+        <processing_script/>
+        <sys_class_name>sys_ui_page</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-04-29 18:18:53</sys_created_on>
+        <sys_id>92856ba597ec8f50645bb6fce053afc2</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>incident_agent_cockpit</sys_name>
+        <sys_package display_value="GitHub Integration" source="x_1841701_github_1">7437836997e88f50645bb6fce053afb7</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="GitHub Integration">7437836997e88f50645bb6fce053afb7</sys_scope>
+        <sys_update_name>sys_ui_page_92856ba597ec8f50645bb6fce053afc2</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-04-29 18:18:53</sys_updated_on>
+    </sys_ui_page>
+    <sys_update_version action="INSERT_OR_UPDATE">
+        <action>DELETE</action>
+        <application display_value="GitHub Integration">7437836997e88f50645bb6fce053afb7</application>
+        <file_path/>
+        <instance_id>4b9809bd93d84f50d9f6ddd548373c6d</instance_id>
+        <instance_name>dev384001</instance_name>
+        <name>sys_ui_page_92856ba597ec8f50645bb6fce053afc2</name>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_ui_page"&gt;&lt;sys_ui_page action="INSERT_OR_UPDATE"&gt;&lt;category&gt;general&lt;/category&gt;&lt;client_script&gt;&lt;![CDATA[// =============================================================================
+// Incident Agent Cockpit — UI Page client script.
+// Vanilla JS, no jQuery. Mirrors the existing Flight Deck conventions.
+// =============================================================================
+
+var IAC = {
+    scope: 'mine',
+    sort: 'urgency',
+    filters: {
+        priority: [],
+        state: [],
+        has_blockers: false,
+        awaiting: false
+    },
+    rows: [],
+    selectedSysId: '',
+    checkedSysIds: {},
+    refreshTimer: null,
+    refreshIntervalMs: 60000
+};
+
+function acById(id) {
+    return document.getElementById(id);
+}
+
+function acEscape(value) {
+    if (value === null || value === undefined)
+        return '';
+    return String(value)
+        .replace(/&amp;/g, '&amp;amp;')
+        .replace(/&lt;/g, '&amp;lt;')
+        .replace(/&gt;/g, '&amp;gt;')
+        .replace(/"/g, '&amp;quot;')
+        .replace(/'/g, '&amp;#39;');
+}
+
+function acShowMessage(type, text) {
+    var el = acById('ac-message');
+    if (!el) return;
+    el.className = 'ac-message ' + type;
+    el.style.display = 'block';
+    el.textContent = text || '';
+}
+
+function acClearMessage() {
+    var el = acById('ac-message');
+    if (!el) return;
+    el.className = 'ac-message';
+    el.style.display = 'none';
+    el.textContent = '';
+}
+
+function acPriorityClass(text) {
+    var p = String(text || '');
+    if (p.indexOf('1') === 0) return 'ac-badge ac-badge-priority-1';
+    if (p.indexOf('2') === 0) return 'ac-badge ac-badge-priority-2';
+    if (p.indexOf('3') === 0) return 'ac-badge ac-badge-priority-3';
+    return 'ac-badge ac-badge-priority-4';
+}
+
+function acStateClass(text) {
+    var s = String(text || '');
+    if (s === 'New') return 'ac-badge ac-badge-state-new';
+    if (s === 'In Progress') return 'ac-badge ac-badge-state-progress';
+    if (s === 'On Hold') return 'ac-badge ac-badge-state-hold';
+    if (s === 'Resolved') return 'ac-badge ac-badge-state-resolved';
+    if (s === 'Closed') return 'ac-badge ac-badge-state-closed';
+    return 'ac-badge ac-badge-neutral';
+}
+
+function acSlaClass(status) {
+    if (status === 'bad') return 'ac-badge ac-badge-sla-bad';
+    if (status === 'warn') return 'ac-badge ac-badge-sla-warn';
+    if (status === 'ok') return 'ac-badge ac-badge-sla-ok';
+    return 'ac-badge ac-badge-neutral';
+}
+
+function acClampPercent(n) {
+    var v = parseInt(n, 10) || 0;
+    if (v &lt; 0) v = 0;
+    if (v &gt; 100) v = 100;
+    return v;
+}
+
+function acFormatAge(minutes) {
+    var m = parseInt(minutes, 10) || 0;
+    if (m &lt; 60) return m + 'm';
+    if (m &lt; 60 * 24) return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+    return Math.floor(m / (60 * 24)) + 'd ' + Math.floor((m % (60 * 24)) / 60) + 'h';
+}
+
+// =============================================================================
+// AJAX wrapper — mirrors fdAjax pattern.
+// =============================================================================
+
+function acAjax(methodName, params, callback) {
+    var ga = new GlideAjax('IncidentAgentCockpitAjax');
+    ga.addParam('sysparm_name', methodName);
+
+    if (params) {
+        for (var key in params) {
+            if (params.hasOwnProperty(key))
+                ga.addParam('sysparm_' + key, params[key]);
+        }
+    }
+
+    ga.getXMLAnswer(function(answer) {
+        var payload = {};
+        try {
+            payload = JSON.parse(answer || '{}');
+        } catch (e) {
+            acShowMessage('error', 'Could not parse server response: ' + e.message);
+            return;
+        }
+        callback(payload || {});
+    });
+}
+
+// =============================================================================
+// Queue load + render
+// =============================================================================
+
+function acLoadQueue(silent) {
+    if (!silent)
+        acShowMessage('info', 'Loading queue...');
+
+    acAjax('loadQueue', {
+        scope: IAC.scope,
+        sort: IAC.sort,
+        filters: JSON.stringify(IAC.filters)
+    }, function(payload) {
+        if (!payload || !payload.ok) {
+            acShowMessage('error', (payload &amp;&amp; payload.message) || 'Could not load queue.');
+            return;
+        }
+
+        IAC.rows = payload.rows || [];
+        acRenderHeader(payload);
+        acRenderPulse(payload.pulse || {});
+        acRenderStrip(IAC.rows);
+        acRenderShiftPulse(payload, IAC.rows);
+        acClearMessage();
+    });
+}
+
+function acRenderHeader(payload) {
+    var name = (payload.user || {}).name || 'agent';
+    acById('ac-greeting').textContent = 'Cockpit — ' + name;
+    acById('ac-subline').textContent = 'Showing ' + (payload.rows || []).length + ' incidents · scope: ' + acScopeLabel(payload.scope) + ' · loaded ' + (payload.shift_started || '');
+
+    var btns = document.querySelectorAll('.ac-scope-btn');
+    var i;
+    for (i = 0; i &lt; btns.length; i++) {
+        if (btns[i].getAttribute('data-scope') === IAC.scope)
+            btns[i].classList.add('active');
+        else
+            btns[i].classList.remove('active');
+    }
+}
+
+function acScopeLabel(s) {
+    if (s === 'group') return 'My group';
+    if (s === 'watch') return 'Watchlist';
+    return 'My incidents';
+}
+
+function acRenderPulse(pulse) {
+    acById('ac-pulse-total').textContent = pulse.total || 0;
+    acById('ac-pulse-at-risk').textContent = pulse.at_risk || 0;
+    acById('ac-pulse-awaiting').textContent = pulse.awaiting_customer || 0;
+    acById('ac-pulse-sla').textContent = pulse.sla_breach || 0;
+    acById('ac-pulse-stale').textContent = pulse.stale || 0;
+}
+
+function acRenderStrip(rows) {
+    var host = acById('ac-strip');
+    if (!host) return;
+
+    if (!rows.length) {
+        host.innerHTML = '&lt;div class="ac-empty"&gt;No incidents match the current scope and filters.&lt;/div&gt;';
+        return;
+    }
+
+    var html = [];
+    var i;
+    for (i = 0; i &lt; rows.length; i++)
+        html.push(acRowHtml(rows[i]));
+
+    host.innerHTML = html.join('');
+}
+
+function acRowHtml(row) {
+    var checked = IAC.checkedSysIds[row.sys_id] ? ' checked="checked"' : '';
+    var selectedCls = (IAC.selectedSysId === row.sys_id) ? ' selected' : '';
+    var scores = row.lite_scores || {};
+    var chip = row.next_action_chip || { label: '', tone: 'neutral' };
+
+    return '' +
+        '&lt;div class="ac-row' + selectedCls + '" data-sys-id="' + acEscape(row.sys_id) + '"&gt;' +
+            '&lt;input type="checkbox" class="ac-row-check" data-row-check="' + acEscape(row.sys_id) + '"' + checked + ' /&gt;' +
+            '&lt;div class="ac-row-id"&gt;' +
+                '&lt;span class="ac-row-number"&gt;' + acEscape(row.number) + '&lt;/span&gt;' +
+                '&lt;div class="ac-row-badges"&gt;' +
+                    '&lt;span class="' + acPriorityClass(row.priority) + '"&gt;' + acEscape(row.priority || 'P?') + '&lt;/span&gt;' +
+                    '&lt;span class="' + acStateClass(row.state) + '"&gt;' + acEscape(row.state || '—') + '&lt;/span&gt;' +
+                '&lt;/div&gt;' +
+            '&lt;/div&gt;' +
+            '&lt;div class="ac-row-title" title="' + acEscape(row.short_description) + '"&gt;' + acEscape(row.short_description || '(no short description)') + '&lt;/div&gt;' +
+            '&lt;div class="ac-row-bars"&gt;' +
+                acBar('readiness', scores.readiness) +
+                acBar('risk', scores.risk) +
+                acBar('dup', scores.dup) +
+                acBar('escalation', scores.escalation) +
+            '&lt;/div&gt;' +
+            '&lt;div class="ac-row-meta"&gt;' +
+                '&lt;span class="ac-chip ac-chip-tone-' + acEscape(chip.tone) + '" style="cursor:default;"&gt;' + acEscape(chip.label || '—') + '&lt;/span&gt;' +
+                '&lt;span class="' + acSlaClass((row.sla || {}).status) + '"&gt;' + acEscape((row.sla || {}).label || 'No SLA') + '&lt;/span&gt;' +
+                '&lt;span&gt;Activity: &lt;strong&gt;' + acFormatAge(row.last_activity_minutes) + '&lt;/strong&gt; ago&lt;/span&gt;' +
+            '&lt;/div&gt;' +
+            '&lt;div class="ac-row-actions"&gt;' +
+                '&lt;button class="ac-icon-btn" type="button" data-row-action="open" data-sys-id="' + acEscape(row.sys_id) + '"&gt;Flight Deck&lt;/button&gt;' +
+                '&lt;button class="ac-icon-btn" type="button" data-row-action="quicknote" data-sys-id="' + acEscape(row.sys_id) + '"&gt;Note&lt;/button&gt;' +
+            '&lt;/div&gt;' +
+        '&lt;/div&gt;';
+}
+
+function acBar(kind, value) {
+    var pct = acClampPercent(value);
+    return '&lt;div class="ac-bar bar-' + kind + '" title="' + kind + ': ' + pct + '"&gt;' +
+        '&lt;div class="ac-bar-fill" style="width:' + pct + '%;"&gt;&lt;/div&gt;' +
+        '&lt;div class="ac-bar-label"&gt;' + pct + '&lt;/div&gt;' +
+    '&lt;/div&gt;';
+}
+
+function acRenderShiftPulse(payload, rows) {
+    var stale = 0;
+    var oldestStaleMin = 0;
+    var i;
+    for (i = 0; i &lt; rows.length; i++) {
+        if ((rows[i].last_activity_minutes || 0) &gt;= 240) {
+            stale++;
+            if (rows[i].last_activity_minutes &gt; oldestStaleMin)
+                oldestStaleMin = rows[i].last_activity_minutes;
+        }
+    }
+    var msg = rows.length + ' in queue · ' + stale + ' stale';
+    if (oldestStaleMin &gt; 0)
+        msg += ' · oldest untouched: ' + acFormatAge(oldestStaleMin);
+    acById('ac-shiftpulse').textContent = msg;
+}
+
+// =============================================================================
+// Focus lane
+// =============================================================================
+
+function acSelectRow(sysId) {
+    IAC.selectedSysId = sysId;
+
+    var rows = document.querySelectorAll('.ac-row');
+    var i;
+    for (i = 0; i &lt; rows.length; i++) {
+        if (rows[i].getAttribute('data-sys-id') === sysId)
+            rows[i].classList.add('selected');
+        else
+            rows[i].classList.remove('selected');
+    }
+
+    acAjax('getFocus', { sys_id: sysId }, function(payload) {
+        if (!payload || !payload.ok) {
+            acRenderFocusEmpty((payload &amp;&amp; payload.message) || 'Could not load incident.');
+            return;
+        }
+        acRenderFocus(payload);
+    });
+}
+
+function acRenderFocusEmpty(msg) {
+    var host = acById('ac-focus');
+    host.innerHTML = '&lt;div class="ac-focus-empty"&gt;&lt;strong&gt;' + acEscape(msg || 'No incident selected.') + '&lt;/strong&gt;&lt;/div&gt;';
+}
+
+function acRenderFocus(p) {
+    var host = acById('ac-focus');
+    var summary = p.summary || {};
+    var metrics = p.metrics || {};
+    var nba = p.next_action || {};
+    var fixCards = p.fix_cards || [];
+    var sla = p.sla || {};
+    var lj = p.last_journal || {};
+
+    var html = '';
+    html += '&lt;h3 class="ac-focus-title"&gt;' + acEscape(p.number || 'Incident') + '&lt;/h3&gt;';
+    html += '&lt;div class="ac-focus-subtitle"&gt;' + acEscape(p.short_description || '') + '&lt;/div&gt;';
+
+    html += '&lt;div class="ac-hero-actions" style="display:flex; gap:6px; margin-bottom:6px;"&gt;';
+    html += '&lt;button class="ac-btn secondary" type="button" data-row-action="open" data-sys-id="' + acEscape(p.sys_id) + '"&gt;Open in Flight Deck&lt;/button&gt;';
+    html += '&lt;/div&gt;';
+
+    html += '&lt;div class="ac-focus-section"&gt;&lt;h4&gt;Snapshot&lt;/h4&gt;&lt;div class="ac-kv-grid"&gt;';
+    html += acKv('Caller', summary.caller);
+    html += acKv('Group', summary.assignment_group);
+    html += acKv('Assigned to', summary.assigned_to);
+    html += acKv('CI', summary.ci);
+    html += acKv('Category', summary.category);
+    html += acKv('Impact / Urgency', (summary.impact || '—') + ' / ' + (summary.urgency || '—'));
+    html += '&lt;/div&gt;&lt;/div&gt;';
+
+    if (sla &amp;&amp; sla.label) {
+        html += '&lt;div class="ac-focus-section"&gt;&lt;h4&gt;SLA&lt;/h4&gt;';
+        html += '&lt;span class="' + acSlaClass(sla.status) + '"&gt;' + acEscape(sla.label) + '&lt;/span&gt;';
+        if (sla.detail)
+            html += '&lt;div class="ac-kv-value" style="margin-top:6px;"&gt;' + acEscape(sla.detail) + '&lt;/div&gt;';
+        html += '&lt;/div&gt;';
+    }
+
+    if (nba &amp;&amp; nba.title) {
+        html += '&lt;div class="ac-focus-section"&gt;&lt;h4&gt;Next best action&lt;/h4&gt;';
+        html += '&lt;div class="ac-kv-value"&gt;&lt;strong&gt;' + acEscape(nba.title) + '&lt;/strong&gt;&lt;/div&gt;';
+        if (nba.rationale)
+            html += '&lt;div class="ac-fix-detail"&gt;' + acEscape(nba.rationale) + '&lt;/div&gt;';
+        html += '&lt;/div&gt;';
+    }
+
+    if (fixCards.length) {
+        html += '&lt;div class="ac-focus-section"&gt;&lt;h4&gt;Top fix cards&lt;/h4&gt;';
+        var i;
+        for (i = 0; i &lt; fixCards.length; i++) {
+            var fc = fixCards[i] || {};
+            var tone = fc.severity || fc.tone || 'info';
+            html += '&lt;div class="ac-fix-card tone-' + acEscape(tone) + '"&gt;';
+            html += '&lt;div class="ac-fix-title"&gt;' + acEscape(fc.title || fc.label || 'Action') + '&lt;/div&gt;';
+            if (fc.detail || fc.description)
+                html += '&lt;div class="ac-fix-detail"&gt;' + acEscape(fc.detail || fc.description) + '&lt;/div&gt;';
+            html += '&lt;/div&gt;';
+        }
+        html += '&lt;/div&gt;';
+    }
+
+    if (metrics &amp;&amp; (metrics.readiness || metrics.reopen_risk || metrics.duplicate_confidence || metrics.escalation_probability)) {
+        html += '&lt;div class="ac-focus-section"&gt;&lt;h4&gt;Metrics&lt;/h4&gt;&lt;div class="ac-kv-grid"&gt;';
+        html += acKv('Readiness', acMetricVal(metrics.readiness));
+        html += acKv('Reopen risk', acMetricVal(metrics.reopen_risk));
+        html += acKv('Duplicate', acMetricVal(metrics.duplicate_confidence));
+        html += acKv('Escalation', acMetricVal(metrics.escalation_probability));
+        html += '&lt;/div&gt;&lt;/div&gt;';
+    }
+
+    if (lj &amp;&amp; lj.text) {
+        html += '&lt;div class="ac-focus-section"&gt;&lt;h4&gt;Last journal entry&lt;/h4&gt;';
+        html += '&lt;div class="ac-kv-label"&gt;' + acEscape(lj.author || '') + ' · ' + acEscape(lj.when || '') + '&lt;/div&gt;';
+        html += '&lt;div class="ac-kv-value" style="white-space:pre-wrap;"&gt;' + acEscape(lj.text) + '&lt;/div&gt;';
+        html += '&lt;/div&gt;';
+    }
+
+    html += '&lt;div class="ac-focus-section"&gt;&lt;h4&gt;Quick work note&lt;/h4&gt;';
+    html += '&lt;div class="ac-quick-form"&gt;';
+    html += '&lt;textarea id="ac-focus-note" placeholder="Add a quick work note..."&gt;&lt;/textarea&gt;';
+    html += '&lt;button class="ac-btn" type="button" id="ac-focus-note-btn" data-sys-id="' + acEscape(p.sys_id) + '"&gt;Save note&lt;/button&gt;';
+    html += '&lt;/div&gt;&lt;/div&gt;';
+
+    host.innerHTML = html;
+
+    var btn = acById('ac-focus-note-btn');
+    if (btn) {
+        btn.onclick = function() {
+            var ta = acById('ac-focus-note');
+            var note = (ta &amp;&amp; ta.value) || '';
+            if (!note) {
+                acShowMessage('error', 'Note cannot be empty.');
+                return;
+            }
+            acAjax('quickUpdate', { sys_id: p.sys_id, note: note }, function(resp) {
+                if (resp &amp;&amp; resp.ok) {
+                    acShowMessage('success', 'Work note added to ' + p.number + '.');
+                    if (ta) ta.value = '';
+                } else {
+                    acShowMessage('error', (resp &amp;&amp; resp.message) || 'Could not save note.');
+                }
+            });
+        };
+    }
+}
+
+function acMetricVal(m) {
+    if (!m) return '—';
+    if (typeof m === 'object' &amp;&amp; m !== null) {
+        if (typeof m.value !== 'undefined') return m.value + (m.unit || '');
+        if (typeof m.percent !== 'undefined') return m.percent + '%';
+    }
+    return String(m);
+}
+
+function acKv(label, value) {
+    return '&lt;div&gt;&lt;div class="ac-kv-label"&gt;' + acEscape(label) + '&lt;/div&gt;&lt;div class="ac-kv-value"&gt;' + acEscape(value || '—') + '&lt;/div&gt;&lt;/div&gt;';
+}
+
+// =============================================================================
+// Bulk tray
+// =============================================================================
+
+function acRefreshBulkTray() {
+    var ids = acCheckedIds();
+    var tray = acById('ac-bulk');
+    var count = acById('ac-bulk-count');
+    if (!tray || !count) return;
+
+    if (ids.length) {
+        tray.style.display = 'flex';
+        count.textContent = ids.length + ' selected';
+        acPauseAutoRefresh();
+    } else {
+        tray.style.display = 'none';
+        acResumeAutoRefresh();
+    }
+}
+
+function acCheckedIds() {
+    var out = [];
+    var k;
+    for (k in IAC.checkedSysIds) {
+        if (IAC.checkedSysIds.hasOwnProperty(k) &amp;&amp; IAC.checkedSysIds[k])
+            out.push(k);
+    }
+    return out;
+}
+
+function acClearChecks() {
+    IAC.checkedSysIds = {};
+    var boxes = document.querySelectorAll('.ac-row-check');
+    var i;
+    for (i = 0; i &lt; boxes.length; i++)
+        boxes[i].checked = false;
+    acRefreshBulkTray();
+}
+
+function acBulk(method, params, successMsg) {
+    var ids = acCheckedIds();
+    if (!ids.length) {
+        acShowMessage('error', 'No incidents selected.');
+        return;
+    }
+    var p = { sys_ids: ids.join(',') };
+    var k;
+    for (k in (params || {})) {
+        if (params.hasOwnProperty(k))
+            p[k] = params[k];
+    }
+    acShowMessage('info', 'Applying bulk action...');
+    acAjax(method, p, function(resp) {
+        if (!resp) {
+            acShowMessage('error', 'Bulk action failed.');
+            return;
+        }
+        if (resp.ok)
+            acShowMessage('success', (successMsg || 'Bulk action applied.') + ' ' + (resp.message || ''));
+        else
+            acShowMessage('error', resp.message || 'Bulk action failed.');
+        acClearChecks();
+        acLoadQueue(true);
+    });
+}
+
+// =============================================================================
+// Filters
+// =============================================================================
+
+function acToggleFilterArr(arr, value) {
+    var i = arr.indexOf(value);
+    if (i &gt;= 0) arr.splice(i, 1);
+    else arr.push(value);
+    return arr;
+}
+
+function acReflectFilterChips() {
+    var chips = document.querySelectorAll('.ac-chip');
+    var i;
+    for (i = 0; i &lt; chips.length; i++) {
+        var chip = chips[i];
+        var pri = chip.getAttribute('data-filter-priority');
+        var st = chip.getAttribute('data-filter-state');
+        var fl = chip.getAttribute('data-filter-flag');
+        var active = false;
+        if (pri &amp;&amp; IAC.filters.priority.indexOf(pri) &gt;= 0) active = true;
+        if (st &amp;&amp; IAC.filters.state.indexOf(st) &gt;= 0) active = true;
+        if (fl === 'has_blockers' &amp;&amp; IAC.filters.has_blockers) active = true;
+        if (fl === 'awaiting' &amp;&amp; IAC.filters.awaiting) active = true;
+        if (active) chip.classList.add('active');
+        else chip.classList.remove('active');
+    }
+}
+
+function acClearFilters() {
+    IAC.filters = { priority: [], state: [], has_blockers: false, awaiting: false };
+    acReflectFilterChips();
+    acLoadQueue();
+}
+
+// =============================================================================
+// Auto-refresh
+// =============================================================================
+
+function acStartAutoRefresh() {
+    acStopAutoRefresh();
+    IAC.refreshTimer = setInterval(function() {
+        if (IAC.selectedSysId) return;          // pause if a row is open in focus
+        if (acCheckedIds().length) return;      // pause if bulk tray is open
+        acLoadQueue(true);
+    }, IAC.refreshIntervalMs);
+}
+
+function acStopAutoRefresh() {
+    if (IAC.refreshTimer) {
+        clearInterval(IAC.refreshTimer);
+        IAC.refreshTimer = null;
+    }
+}
+
+function acPauseAutoRefresh() { /* keep timer alive but the guards in acStartAutoRefresh skip ticks */ }
+function acResumeAutoRefresh() { /* same — no-op; here for readability */ }
+
+// =============================================================================
+// Event delegation
+// =============================================================================
+
+function acHandleClick(evt) {
+    var node = evt.target || evt.srcElement;
+    var rowAction = '';
+    var scope = '';
+    var pulse = '';
+    var rowSysId = '';
+
+    // Let the change handler deal with checkbox clicks — don't open focus lane.
+    if (node &amp;&amp; (node.tagName === 'INPUT' || node.tagName === 'TEXTAREA' || node.tagName === 'SELECT'))
+        return;
+
+    while (node &amp;&amp; node !== document) {
+        if (node.getAttribute) {
+            rowAction = node.getAttribute('data-row-action');
+            scope = node.getAttribute('data-scope');
+            pulse = node.getAttribute('data-pulse');
+            if (!rowSysId)
+                rowSysId = node.getAttribute('data-sys-id');
+        }
+        if (rowAction || scope || pulse) break;
+        node = node.parentNode;
+    }
+
+    // Scope toggle
+    if (scope) {
+        evt.preventDefault();
+        IAC.scope = scope;
+        IAC.selectedSysId = '';
+        acRenderFocusEmpty('No incident selected.');
+        acClearChecks();
+        acLoadQueue();
+        return;
+    }
+
+    // Pulse-tile filter shortcuts
+    if (pulse) {
+        evt.preventDefault();
+        if (pulse === 'sla_breach') { IAC.filters = { priority: [], state: [], has_blockers: false, awaiting: false }; }
+        else if (pulse === 'awaiting_customer') { IAC.filters.awaiting = true; }
+        else if (pulse === 'at_risk') { IAC.sort = 'urgency'; var ss = acById('ac-sort-select'); if (ss) ss.value = 'urgency'; }
+        else if (pulse === 'stale') { IAC.sort = 'last_activity'; var ss2 = acById('ac-sort-select'); if (ss2) ss2.value = 'last_activity'; }
+        acReflectFilterChips();
+        acLoadQueue();
+        return;
+    }
+
+    // Per-row actions
+    if (rowAction === 'open' &amp;&amp; rowSysId) {
+        evt.preventDefault();
+        window.open('incident_flight_deck.do?incident_sys_id=' + encodeURIComponent(rowSysId), '_blank');
+        return;
+    }
+
+    if (rowAction === 'quicknote' &amp;&amp; rowSysId) {
+        evt.preventDefault();
+        var note = window.prompt('Quick work note for selected incident:');
+        if (note) {
+            acAjax('quickUpdate', { sys_id: rowSysId, note: note }, function(resp) {
+                if (resp &amp;&amp; resp.ok)
+                    acShowMessage('success', 'Work note added.');
+                else
+                    acShowMessage('error', (resp &amp;&amp; resp.message) || 'Could not save note.');
+            });
+        }
+        return;
+    }
+
+    // Filter chip
+    var chipNode = evt.target || evt.srcElement;
+    while (chipNode &amp;&amp; chipNode !== document) {
+        if (chipNode.classList &amp;&amp; chipNode.classList.contains('ac-chip')) break;
+        chipNode = chipNode.parentNode;
+    }
+    if (chipNode &amp;&amp; chipNode !== document &amp;&amp; chipNode.classList &amp;&amp; chipNode.classList.contains('ac-chip')) {
+        if (chipNode.id === 'ac-clear-filters') {
+            acClearFilters();
+            return;
+        }
+        var pri = chipNode.getAttribute('data-filter-priority');
+        var st = chipNode.getAttribute('data-filter-state');
+        var fl = chipNode.getAttribute('data-filter-flag');
+        if (pri) acToggleFilterArr(IAC.filters.priority, pri);
+        if (st) acToggleFilterArr(IAC.filters.state, st);
+        if (fl === 'has_blockers') IAC.filters.has_blockers = !IAC.filters.has_blockers;
+        if (fl === 'awaiting') IAC.filters.awaiting = !IAC.filters.awaiting;
+        acReflectFilterChips();
+        acLoadQueue();
+        return;
+    }
+
+    // Click on a row (not a button) -&gt; select for focus lane
+    var rowNode = evt.target || evt.srcElement;
+    while (rowNode &amp;&amp; rowNode !== document) {
+        if (rowNode.classList &amp;&amp; rowNode.classList.contains('ac-row')) break;
+        rowNode = rowNode.parentNode;
+    }
+    if (rowNode &amp;&amp; rowNode !== document &amp;&amp; rowNode.classList &amp;&amp; rowNode.classList.contains('ac-row')) {
+        var sysId = rowNode.getAttribute('data-sys-id');
+        if (sysId) acSelectRow(sysId);
+    }
+}
+
+function acHandleChange(evt) {
+    var t = evt.target || evt.srcElement;
+    if (!t) return;
+
+    if (t.id === 'ac-sort-select') {
+        IAC.sort = t.value || 'urgency';
+        acLoadQueue();
+        return;
+    }
+
+    var rowCheck = t.getAttribute &amp;&amp; t.getAttribute('data-row-check');
+    if (rowCheck) {
+        IAC.checkedSysIds[rowCheck] = !!t.checked;
+        acRefreshBulkTray();
+    }
+}
+
+function acBindEvents() {
+    document.addEventListener('click', acHandleClick);
+    document.addEventListener('change', acHandleChange);
+
+    var refresh = acById('ac-refresh-btn');
+    if (refresh) refresh.onclick = function() { acLoadQueue(); };
+
+    var openFlight = acById('ac-open-flightdeck');
+    if (openFlight) openFlight.onclick = function() {
+        if (IAC.selectedSysId)
+            window.open('incident_flight_deck.do?incident_sys_id=' + encodeURIComponent(IAC.selectedSysId), '_blank');
+        else
+            acShowMessage('info', 'Select an incident row first to open it in the Flight Deck.');
+    };
+
+    var ack = acById('ac-bulk-ack');
+    if (ack) ack.onclick = function() {
+        var note = (acById('ac-bulk-note') || {}).value || '';
+        acBulk('bulkAck', { note: note }, 'Acknowledged.');
+    };
+
+    var transition = acById('ac-bulk-transition');
+    if (transition) transition.onclick = function() {
+        var state = (acById('ac-bulk-state') || {}).value || '';
+        var note = (acById('ac-bulk-note') || {}).value || '';
+        if (!state) {
+            acShowMessage('error', 'Pick a transition target first.');
+            return;
+        }
+        acBulk('bulkTransition', { state: state, note: note }, 'State updated.');
+    };
+
+    var reassign = acById('ac-bulk-reassign');
+    if (reassign) reassign.onclick = function() {
+        var group = (acById('ac-bulk-group') || {}).value || '';
+        var note = (acById('ac-bulk-note') || {}).value || '';
+        if (!group) {
+            acShowMessage('error', 'Group sys_id is required for reassign.');
+            return;
+        }
+        acBulk('bulkReassign', { group: group, note: note }, 'Reassigned.');
+    };
+
+    var cancel = acById('ac-bulk-cancel');
+    if (cancel) cancel.onclick = function() { acClearChecks(); };
+}
+
+function initIncidentAgentCockpit() {
+    var holder = acById('ac-initial-scope');
+    IAC.scope = holder ? (holder.value || 'mine') : 'mine';
+
+    acBindEvents();
+    acReflectFilterChips();
+    acLoadQueue();
+    acStartAutoRefresh();
+}
+
+if (typeof addLoadEvent === 'function')
+    addLoadEvent(initIncidentAgentCockpit);
+else if (window.addEventListener)
+    window.addEventListener('load', initIncidentAgentCockpit);
+else
+    window.onload = initIncidentAgentCockpit;]]&gt;&lt;/client_script&gt;&lt;description/&gt;&lt;direct&gt;false&lt;/direct&gt;&lt;endpoint&gt;x_1841701_github_1_incident_agent_cockpit.do&lt;/endpoint&gt;&lt;html&gt;&lt;![CDATA[&lt;?xml version="1.0" encoding="utf-8"?&gt;
+&lt;j:jelly trim="false" xmlns:j="jelly:core" xmlns:g="glide"&gt;
+
+    &lt;g:evaluate var="jvar_initial_scope" expression="RP.getParameterValue('scope') || 'mine'" /&gt;
+
+    &lt;html&gt;
+    &lt;head&gt;
+        &lt;title&gt;Incident Agent Cockpit&lt;/title&gt;
+        &lt;style&gt;
+            * {
+                box-sizing: border-box;
+            }
+
+            body {
+                margin: 0;
+                font-family: Arial, sans-serif;
+                background: #f4f7fb;
+                color: #152033;
+            }
+
+            .ac-shell {
+                padding: 18px 20px 96px 20px;
+            }
+
+            /* ===== Hero ===== */
+            .ac-hero {
+                display: grid;
+                grid-template-columns: 1.6fr 1fr;
+                gap: 16px;
+                background: linear-gradient(135deg, #0f172a, #172554 68%, #1d4ed8);
+                color: #ffffff;
+                border-radius: 18px;
+                padding: 18px 22px;
+                box-shadow: 0 14px 36px rgba(15, 23, 42, 0.22);
+                margin-bottom: 14px;
+            }
+
+            .ac-eyebrow {
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 0.16em;
+                font-weight: bold;
+                color: rgba(255, 255, 255, 0.76);
+                margin-bottom: 6px;
+            }
+
+            .ac-title {
+                margin: 0;
+                font-size: 26px;
+                line-height: 1.1;
+                font-weight: 700;
+            }
+
+            .ac-subline {
+                color: rgba(255, 255, 255, 0.86);
+                font-size: 13px;
+                line-height: 1.5;
+                margin-top: 6px;
+            }
+
+            .ac-hero-right {
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+                align-items: flex-end;
+                justify-content: space-between;
+            }
+
+            .ac-scope {
+                display: inline-flex;
+                background: rgba(255, 255, 255, 0.10);
+                border: 1px solid rgba(255, 255, 255, 0.18);
+                border-radius: 999px;
+                padding: 3px;
+            }
+
+            .ac-scope-btn {
+                background: transparent;
+                color: rgba(255, 255, 255, 0.85);
+                border: 0;
+                padding: 7px 14px;
+                border-radius: 999px;
+                font-size: 12px;
+                font-weight: bold;
+                cursor: pointer;
+            }
+
+            .ac-scope-btn.active {
+                background: rgba(255, 255, 255, 0.92);
+                color: #1d4ed8;
+            }
+
+            .ac-hero-actions {
+                display: flex;
+                gap: 8px;
+            }
+
+            .ac-link-btn {
+                display: inline-flex;
+                align-items: center;
+                padding: 9px 12px;
+                border-radius: 10px;
+                text-decoration: none;
+                background: rgba(255, 255, 255, 0.12);
+                color: #ffffff;
+                font-weight: bold;
+                border: 1px solid rgba(255, 255, 255, 0.16);
+                font-size: 12px;
+                cursor: pointer;
+            }
+
+            .ac-link-btn:hover {
+                background: rgba(255, 255, 255, 0.20);
+            }
+
+            /* ===== Pulse tiles ===== */
+            .ac-pulse {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+                gap: 12px;
+                margin-bottom: 14px;
+            }
+
+            .ac-tile {
+                background: #ffffff;
+                border-radius: 14px;
+                padding: 14px 16px;
+                box-shadow: 0 4px 12px rgba(15, 23, 42, 0.06);
+                border: 1px solid #e2e8f0;
+                cursor: pointer;
+                transition: transform 0.08s ease, box-shadow 0.12s ease;
+            }
+
+            .ac-tile:hover {
+                transform: translateY(-1px);
+                box-shadow: 0 8px 18px rgba(15, 23, 42, 0.10);
+            }
+
+            .ac-tile.active {
+                border-color: #1d4ed8;
+                box-shadow: 0 0 0 2px rgba(29, 78, 216, 0.18);
+            }
+
+            .ac-tile-label {
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 0.08em;
+                font-weight: bold;
+                color: #475467;
+                margin-bottom: 6px;
+            }
+
+            .ac-tile-value {
+                font-size: 28px;
+                font-weight: 700;
+                color: #0f172a;
+                line-height: 1;
+            }
+
+            .ac-tile-hint {
+                font-size: 11px;
+                color: #667085;
+                margin-top: 6px;
+            }
+
+            .ac-tile.tile-danger .ac-tile-value { color: #dc2626; }
+            .ac-tile.tile-warn .ac-tile-value { color: #d97706; }
+            .ac-tile.tile-info .ac-tile-value { color: #1d4ed8; }
+
+            /* ===== Sort + filter bar ===== */
+            .ac-sortbar {
+                display: flex;
+                gap: 14px;
+                align-items: center;
+                flex-wrap: wrap;
+                background: #ffffff;
+                border-radius: 14px;
+                padding: 12px 14px;
+                margin-bottom: 14px;
+                border: 1px solid #e2e8f0;
+            }
+
+            .ac-sort-label {
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 0.08em;
+                font-weight: bold;
+                color: #475467;
+            }
+
+            .ac-sort-select {
+                border: 1px solid #cfd8e3;
+                border-radius: 8px;
+                padding: 7px 10px;
+                font-size: 13px;
+                color: #111827;
+                background: #ffffff;
+            }
+
+            .ac-chip-row {
+                display: flex;
+                gap: 6px;
+                flex-wrap: wrap;
+            }
+
+            .ac-chip {
+                display: inline-flex;
+                align-items: center;
+                padding: 5px 11px;
+                border-radius: 999px;
+                background: #eef2ff;
+                color: #1d4ed8;
+                border: 1px solid #c7d2fe;
+                font-size: 12px;
+                font-weight: bold;
+                cursor: pointer;
+                user-select: none;
+            }
+
+            .ac-chip.active {
+                background: #1d4ed8;
+                color: #ffffff;
+            }
+
+            .ac-chip.muted {
+                background: #f1f5f9;
+                color: #475467;
+                border-color: #cbd5e1;
+            }
+
+            /* ===== Main grid ===== */
+            .ac-grid {
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) 360px;
+                gap: 14px;
+            }
+
+            @media (max-width: 1100px) {
+                .ac-grid {
+                    grid-template-columns: 1fr;
+                }
+            }
+
+            /* ===== Strip list ===== */
+            .ac-strip {
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+            }
+
+            .ac-row {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 12px;
+                padding: 10px 14px;
+                display: grid;
+                grid-template-columns: 24px 110px 1fr 220px 160px 110px;
+                gap: 12px;
+                align-items: center;
+                cursor: pointer;
+                transition: border-color 0.1s ease, box-shadow 0.12s ease;
+            }
+
+            .ac-row:hover {
+                border-color: #c7d2fe;
+                box-shadow: 0 4px 14px rgba(15, 23, 42, 0.06);
+            }
+
+            .ac-row.selected {
+                border-color: #1d4ed8;
+                box-shadow: 0 0 0 2px rgba(29, 78, 216, 0.16);
+            }
+
+            @media (max-width: 1100px) {
+                .ac-row {
+                    grid-template-columns: 24px 1fr;
+                    grid-template-areas:
+                        "check id"
+                        "check title"
+                        "check meta";
+                    row-gap: 6px;
+                }
+            }
+
+            .ac-row-check {
+                margin: 0;
+            }
+
+            .ac-row-id {
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+            }
+
+            .ac-row-number {
+                font-weight: bold;
+                font-size: 13px;
+                color: #0f172a;
+            }
+
+            .ac-row-badges {
+                display: flex;
+                gap: 4px;
+                flex-wrap: wrap;
+            }
+
+            .ac-row-title {
+                min-width: 0;
+                color: #111827;
+                font-size: 13px;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+
+            .ac-row-bars {
+                display: grid;
+                grid-template-columns: repeat(4, 1fr);
+                gap: 6px;
+            }
+
+            .ac-bar {
+                position: relative;
+                background: #f1f5f9;
+                border-radius: 6px;
+                height: 22px;
+                overflow: hidden;
+            }
+
+            .ac-bar-fill {
+                position: absolute;
+                inset: 0 auto 0 0;
+                background: #6366f1;
+                border-radius: 6px;
+                opacity: 0.85;
+            }
+
+            .ac-bar.bar-readiness .ac-bar-fill { background: #10b981; }
+            .ac-bar.bar-risk .ac-bar-fill { background: #f59e0b; }
+            .ac-bar.bar-dup .ac-bar-fill { background: #6366f1; }
+            .ac-bar.bar-escalation .ac-bar-fill { background: #ef4444; }
+
+            .ac-bar-label {
+                position: absolute;
+                inset: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 10px;
+                font-weight: bold;
+                color: #0f172a;
+            }
+
+            .ac-row-meta {
+                display: flex;
+                flex-direction: column;
+                font-size: 11px;
+                color: #475467;
+                gap: 2px;
+            }
+
+            .ac-row-meta strong {
+                color: #111827;
+                font-size: 12px;
+            }
+
+            .ac-row-actions {
+                display: flex;
+                gap: 6px;
+                justify-content: flex-end;
+                flex-wrap: wrap;
+            }
+
+            .ac-icon-btn {
+                background: #f1f5f9;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+                padding: 6px 9px;
+                font-size: 11px;
+                font-weight: bold;
+                color: #1d4ed8;
+                cursor: pointer;
+            }
+
+            .ac-icon-btn:hover {
+                background: #e0e7ff;
+            }
+
+            /* ===== Badges (mirror Flight Deck tones) ===== */
+            .ac-badge {
+                display: inline-flex;
+                align-items: center;
+                padding: 3px 8px;
+                border-radius: 999px;
+                font-size: 10px;
+                font-weight: bold;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+            }
+
+            .ac-badge-priority-1 { background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; }
+            .ac-badge-priority-2 { background: #ffedd5; color: #c2410c; border: 1px solid #fed7aa; }
+            .ac-badge-priority-3 { background: #fef9c3; color: #a16207; border: 1px solid #fde68a; }
+            .ac-badge-priority-4 { background: #dbeafe; color: #1d4ed8; border: 1px solid #bfdbfe; }
+            .ac-badge-state-new { background: #dbeafe; color: #1d4ed8; }
+            .ac-badge-state-progress { background: #ccfbf1; color: #0f766e; }
+            .ac-badge-state-hold { background: #fef9c3; color: #a16207; }
+            .ac-badge-state-resolved { background: #dcfce7; color: #166534; }
+            .ac-badge-state-closed { background: #e2e8f0; color: #475467; }
+            .ac-badge-neutral { background: #e2e8f0; color: #475467; }
+            .ac-badge-sla-bad { background: #fee2e2; color: #b91c1c; }
+            .ac-badge-sla-warn { background: #fef3c7; color: #b45309; }
+            .ac-badge-sla-ok { background: #dcfce7; color: #166534; }
+
+            .ac-chip-tone-danger { background: #fee2e2; color: #b91c1c; border-color: #fecaca; }
+            .ac-chip-tone-warn { background: #fef3c7; color: #b45309; border-color: #fde68a; }
+            .ac-chip-tone-info { background: #dbeafe; color: #1d4ed8; border-color: #bfdbfe; }
+            .ac-chip-tone-neutral { background: #e2e8f0; color: #475467; border-color: #cbd5e1; }
+
+            /* ===== Focus lane ===== */
+            .ac-focus {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 14px;
+                padding: 16px;
+                position: sticky;
+                top: 16px;
+                align-self: start;
+                max-height: calc(100vh - 32px);
+                overflow-y: auto;
+            }
+
+            .ac-focus-empty {
+                color: #667085;
+                font-size: 13px;
+                line-height: 1.55;
+            }
+
+            .ac-focus-title {
+                font-size: 16px;
+                font-weight: 700;
+                color: #0f172a;
+                margin: 0 0 4px 0;
+            }
+
+            .ac-focus-subtitle {
+                font-size: 12px;
+                color: #475467;
+                margin-bottom: 12px;
+            }
+
+            .ac-focus-section {
+                margin-top: 14px;
+                padding-top: 14px;
+                border-top: 1px solid #eef2f7;
+            }
+
+            .ac-focus-section h4 {
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 0.08em;
+                color: #475467;
+                margin: 0 0 8px 0;
+            }
+
+            .ac-kv-grid {
+                display: grid;
+                grid-template-columns: repeat(2, 1fr);
+                gap: 8px 12px;
+            }
+
+            .ac-kv-label {
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 0.06em;
+                color: #667085;
+                font-weight: bold;
+            }
+
+            .ac-kv-value {
+                font-size: 12px;
+                color: #111827;
+                margin-top: 2px;
+            }
+
+            .ac-fix-card {
+                background: #f8fafc;
+                border: 1px solid #e2e8f0;
+                border-left: 4px solid #6366f1;
+                border-radius: 10px;
+                padding: 10px 12px;
+                margin-bottom: 8px;
+            }
+
+            .ac-fix-card.tone-high { border-left-color: #ef4444; }
+            .ac-fix-card.tone-medium { border-left-color: #f59e0b; }
+            .ac-fix-card.tone-info { border-left-color: #6366f1; }
+
+            .ac-fix-title {
+                font-size: 12px;
+                font-weight: bold;
+                color: #0f172a;
+            }
+
+            .ac-fix-detail {
+                font-size: 11px;
+                color: #475467;
+                line-height: 1.5;
+                margin-top: 4px;
+            }
+
+            .ac-quick-form {
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                margin-top: 10px;
+            }
+
+            .ac-quick-form textarea {
+                width: 100%;
+                border: 1px solid #cfd8e3;
+                border-radius: 8px;
+                padding: 8px 10px;
+                font-family: Arial, sans-serif;
+                font-size: 12px;
+                min-height: 64px;
+                resize: vertical;
+            }
+
+            .ac-btn {
+                background: #1d4ed8;
+                color: #ffffff;
+                border: 0;
+                border-radius: 10px;
+                padding: 9px 14px;
+                font-size: 12px;
+                font-weight: bold;
+                cursor: pointer;
+            }
+
+            .ac-btn:hover { background: #1e40af; }
+            .ac-btn.secondary { background: #f1f5f9; color: #1d4ed8; border: 1px solid #cbd5e1; }
+            .ac-btn.secondary:hover { background: #e0e7ff; }
+            .ac-btn.danger { background: #dc2626; }
+            .ac-btn.danger:hover { background: #b91c1c; }
+
+            /* ===== Bulk tray ===== */
+            .ac-bulk {
+                position: fixed;
+                left: 20px;
+                right: 20px;
+                bottom: 16px;
+                background: #0f172a;
+                color: #ffffff;
+                border-radius: 14px;
+                padding: 12px 16px;
+                box-shadow: 0 18px 40px rgba(15, 23, 42, 0.30);
+                display: flex;
+                gap: 12px;
+                align-items: center;
+                z-index: 50;
+            }
+
+            .ac-bulk-count {
+                font-size: 13px;
+                font-weight: bold;
+            }
+
+            .ac-bulk select,
+            .ac-bulk input[type="text"] {
+                background: #1e293b;
+                color: #e2e8f0;
+                border: 1px solid #334155;
+                border-radius: 8px;
+                padding: 7px 10px;
+                font-size: 12px;
+            }
+
+            .ac-bulk .ac-btn {
+                background: #1d4ed8;
+            }
+
+            .ac-bulk .ac-btn.secondary {
+                background: transparent;
+                color: #cbd5e1;
+                border: 1px solid #334155;
+            }
+
+            /* ===== Shift pulse ===== */
+            .ac-shiftpulse {
+                margin-top: 16px;
+                padding: 12px 16px;
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 12px;
+                font-size: 12px;
+                color: #475467;
+            }
+
+            /* ===== Message bar ===== */
+            .ac-message {
+                margin-bottom: 12px;
+                padding: 10px 14px;
+                border-radius: 10px;
+                font-size: 13px;
+                display: none;
+            }
+
+            .ac-message.info { background: #dbeafe; color: #1d4ed8; border: 1px solid #bfdbfe; }
+            .ac-message.success { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+            .ac-message.error { background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; }
+
+            .ac-empty {
+                background: #ffffff;
+                border: 1px dashed #cbd5e1;
+                border-radius: 12px;
+                padding: 32px;
+                text-align: center;
+                color: #667085;
+                font-size: 13px;
+            }
+        &lt;/style&gt;
+    &lt;/head&gt;
+    &lt;body&gt;
+        &lt;div class="ac-shell"&gt;
+
+            &lt;header class="ac-hero"&gt;
+                &lt;div&gt;
+                    &lt;div class="ac-eyebrow"&gt;Incident Agent Cockpit&lt;/div&gt;
+                    &lt;h1 class="ac-title" id="ac-greeting"&gt;Loading your queue...&lt;/h1&gt;
+                    &lt;div class="ac-subline" id="ac-subline"&gt;Reusing the Flight Deck scoring engine to rank every open incident in your scope.&lt;/div&gt;
+                &lt;/div&gt;
+                &lt;div class="ac-hero-right"&gt;
+                    &lt;div class="ac-scope" role="tablist"&gt;
+                        &lt;button class="ac-scope-btn" type="button" data-scope="mine"&gt;My incidents&lt;/button&gt;
+                        &lt;button class="ac-scope-btn" type="button" data-scope="group"&gt;My group&lt;/button&gt;
+                        &lt;button class="ac-scope-btn" type="button" data-scope="watch"&gt;Watchlist&lt;/button&gt;
+                    &lt;/div&gt;
+                    &lt;div class="ac-hero-actions"&gt;
+                        &lt;button class="ac-link-btn" type="button" id="ac-refresh-btn"&gt;Refresh&lt;/button&gt;
+                        &lt;a class="ac-link-btn" href="javascript:void(0)" id="ac-open-flightdeck"&gt;Open Flight Deck&lt;/a&gt;
+                    &lt;/div&gt;
+                &lt;/div&gt;
+            &lt;/header&gt;
+
+            &lt;div id="ac-message" class="ac-message"&gt;&lt;/div&gt;
+
+            &lt;section class="ac-pulse" id="ac-pulse"&gt;
+                &lt;div class="ac-tile" data-pulse="total"&gt;
+                    &lt;div class="ac-tile-label"&gt;Total open&lt;/div&gt;
+                    &lt;div class="ac-tile-value" id="ac-pulse-total"&gt;0&lt;/div&gt;
+                    &lt;div class="ac-tile-hint"&gt;In current scope (capped at 50)&lt;/div&gt;
+                &lt;/div&gt;
+                &lt;div class="ac-tile tile-danger" data-pulse="at_risk"&gt;
+                    &lt;div class="ac-tile-label"&gt;At-risk&lt;/div&gt;
+                    &lt;div class="ac-tile-value" id="ac-pulse-at-risk"&gt;0&lt;/div&gt;
+                    &lt;div class="ac-tile-hint"&gt;Escalation probability ≥ 65&lt;/div&gt;
+                &lt;/div&gt;
+                &lt;div class="ac-tile tile-warn" data-pulse="awaiting_customer"&gt;
+                    &lt;div class="ac-tile-label"&gt;Awaiting&lt;/div&gt;
+                    &lt;div class="ac-tile-value" id="ac-pulse-awaiting"&gt;0&lt;/div&gt;
+                    &lt;div class="ac-tile-hint"&gt;On-hold / awaiting input&lt;/div&gt;
+                &lt;/div&gt;
+                &lt;div class="ac-tile tile-danger" data-pulse="sla_breach"&gt;
+                    &lt;div class="ac-tile-label"&gt;SLA breach&lt;/div&gt;
+                    &lt;div class="ac-tile-value" id="ac-pulse-sla"&gt;0&lt;/div&gt;
+                    &lt;div class="ac-tile-hint"&gt;Already breached active SLA&lt;/div&gt;
+                &lt;/div&gt;
+                &lt;div class="ac-tile tile-info" data-pulse="stale"&gt;
+                    &lt;div class="ac-tile-label"&gt;Stale&lt;/div&gt;
+                    &lt;div class="ac-tile-value" id="ac-pulse-stale"&gt;0&lt;/div&gt;
+                    &lt;div class="ac-tile-hint"&gt;No update in 4+ hours&lt;/div&gt;
+                &lt;/div&gt;
+            &lt;/section&gt;
+
+            &lt;section class="ac-sortbar"&gt;
+                &lt;span class="ac-sort-label"&gt;Sort&lt;/span&gt;
+                &lt;select class="ac-sort-select" id="ac-sort-select"&gt;
+                    &lt;option value="urgency"&gt;Urgency score&lt;/option&gt;
+                    &lt;option value="sla"&gt;SLA breach time&lt;/option&gt;
+                    &lt;option value="last_activity"&gt;Last activity&lt;/option&gt;
+                    &lt;option value="reopen"&gt;Reopen risk&lt;/option&gt;
+                &lt;/select&gt;
+
+                &lt;span class="ac-sort-label"&gt;Filter&lt;/span&gt;
+                &lt;div class="ac-chip-row"&gt;
+                    &lt;span class="ac-chip" data-filter-priority="1"&gt;P1&lt;/span&gt;
+                    &lt;span class="ac-chip" data-filter-priority="2"&gt;P2&lt;/span&gt;
+                    &lt;span class="ac-chip" data-filter-priority="3"&gt;P3&lt;/span&gt;
+                    &lt;span class="ac-chip" data-filter-state="1"&gt;New&lt;/span&gt;
+                    &lt;span class="ac-chip" data-filter-state="2"&gt;In progress&lt;/span&gt;
+                    &lt;span class="ac-chip" data-filter-flag="has_blockers"&gt;Has blockers&lt;/span&gt;
+                    &lt;span class="ac-chip" data-filter-flag="awaiting"&gt;Awaiting customer&lt;/span&gt;
+                    &lt;span class="ac-chip muted" id="ac-clear-filters"&gt;Clear&lt;/span&gt;
+                &lt;/div&gt;
+            &lt;/section&gt;
+
+            &lt;main class="ac-grid"&gt;
+                &lt;div class="ac-strip" id="ac-strip"&gt;
+                    &lt;div class="ac-empty"&gt;Loading queue...&lt;/div&gt;
+                &lt;/div&gt;
+
+                &lt;aside class="ac-focus" id="ac-focus"&gt;
+                    &lt;div class="ac-focus-empty"&gt;
+                        &lt;strong&gt;No incident selected.&lt;/strong&gt;
+                        &lt;div style="margin-top:6px;"&gt;Click any row to see its top fix cards, blockers, and last journal entry — or open the full Flight Deck for a deep dive.&lt;/div&gt;
+                    &lt;/div&gt;
+                &lt;/aside&gt;
+            &lt;/main&gt;
+
+            &lt;div class="ac-shiftpulse" id="ac-shiftpulse"&gt;
+                Welcome — start with the highest-urgency rows. Stale incidents appear at the bottom of the list and on the Stale tile above.
+            &lt;/div&gt;
+        &lt;/div&gt;
+
+        &lt;footer class="ac-bulk" id="ac-bulk" style="display:none;"&gt;
+            &lt;span class="ac-bulk-count" id="ac-bulk-count"&gt;0 selected&lt;/span&gt;
+            &lt;input type="text" id="ac-bulk-note" placeholder="Optional note (becomes work_notes)" style="flex:1; min-width:200px;" /&gt;
+            &lt;select id="ac-bulk-state"&gt;
+                &lt;option value=""&gt;— transition —&lt;/option&gt;
+                &lt;option value="2"&gt;In Progress&lt;/option&gt;
+                &lt;option value="3"&gt;On Hold&lt;/option&gt;
+            &lt;/select&gt;
+            &lt;input type="text" id="ac-bulk-group" placeholder="Reassign group sys_id" style="width:200px;" /&gt;
+            &lt;button class="ac-btn" type="button" id="ac-bulk-ack"&gt;Acknowledge&lt;/button&gt;
+            &lt;button class="ac-btn" type="button" id="ac-bulk-transition"&gt;Transition&lt;/button&gt;
+            &lt;button class="ac-btn" type="button" id="ac-bulk-reassign"&gt;Reassign&lt;/button&gt;
+            &lt;button class="ac-btn secondary" type="button" id="ac-bulk-cancel"&gt;Cancel&lt;/button&gt;
+        &lt;/footer&gt;
+
+        &lt;input type="hidden" id="ac-initial-scope" value="${jvar_initial_scope}" /&gt;
+    &lt;/body&gt;
+    &lt;/html&gt;
+
+&lt;/j:jelly&gt;
+]]&gt;&lt;/html&gt;&lt;name&gt;incident_agent_cockpit&lt;/name&gt;&lt;processing_script/&gt;&lt;sys_class_name&gt;sys_ui_page&lt;/sys_class_name&gt;&lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;&lt;sys_created_on&gt;2026-04-29 18:18:53&lt;/sys_created_on&gt;&lt;sys_id&gt;92856ba597ec8f50645bb6fce053afc2&lt;/sys_id&gt;&lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;&lt;sys_name&gt;incident_agent_cockpit&lt;/sys_name&gt;&lt;sys_package display_value="GitHub Integration" source="x_1841701_github_1"&gt;7437836997e88f50645bb6fce053afb7&lt;/sys_package&gt;&lt;sys_policy/&gt;&lt;sys_scope display_value="GitHub Integration"&gt;7437836997e88f50645bb6fce053afb7&lt;/sys_scope&gt;&lt;sys_update_name&gt;sys_ui_page_92856ba597ec8f50645bb6fce053afc2&lt;/sys_update_name&gt;&lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;&lt;sys_updated_on&gt;2026-04-29 18:18:53&lt;/sys_updated_on&gt;&lt;/sys_ui_page&gt;&lt;/record_update&gt;</payload>
+        <payload_hash>-1795154765</payload_hash>
+        <record_name>incident_agent_cockpit</record_name>
+        <reverted_from/>
+        <source>07f4e76597ec8f50645bb6fce053afc1</source>
+        <source_table>sys_update_set</source_table>
+        <state>current</state>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-04-29 18:18:53</sys_created_on>
+        <sys_id>67d5e3e597ec8f50645bb6fce053aff6</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_recorded_at>19dda7720870000001</sys_recorded_at>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-04-29 18:18:53</sys_updated_on>
+        <type>UI Page</type>
+        <update_guid>27d5e3e582ec8f50dc48c37ab38ea7f5</update_guid>
+        <update_guid_history>27d5e3e582ec8f50dc48c37ab38ea7f5:-1795154765</update_guid_history>
+    </sys_update_version>
+    <sys_metadata_delete action="INSERT_OR_UPDATE">
+        <sys_audit_delete/>
+        <sys_class_name>sys_metadata_delete</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-04-29 18:24:13</sys_created_on>
+        <sys_db_object display_value="" name="sys_ui_page">sys_ui_page</sys_db_object>
+        <sys_id>9fbaf9218654423fa47ecc4a5e1e6a69</sys_id>
+        <sys_metadata>92856ba597ec8f50645bb6fce053afc2</sys_metadata>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>incident_agent_cockpit</sys_name>
+        <sys_package display_value="GitHub Integration" source="x_1841701_github_1">7437836997e88f50645bb6fce053afb7</sys_package>
+        <sys_parent/>
+        <sys_policy/>
+        <sys_scope display_value="GitHub Integration">7437836997e88f50645bb6fce053afb7</sys_scope>
+        <sys_scope_delete display_value="">7aada33ad7b54fccbcc81387840f0990</sys_scope_delete>
+        <sys_update_name>sys_ui_page_92856ba597ec8f50645bb6fce053afc2</sys_update_name>
+        <sys_update_version display_value="sys_ui_page_92856ba597ec8f50645bb6fce053afc2">67d5e3e597ec8f50645bb6fce053aff6</sys_update_version>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-04-29 18:24:13</sys_updated_on>
+    </sys_metadata_delete>
+</record_update>
