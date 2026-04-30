@@ -13,7 +13,7 @@
 BidirectionalTest.prototype = {
     initialize: function() {
     },
-//Test from GitHub to ServiceNow
+//Updated FROM GITHUB - Bidirectiional Test Proof
     type: 'BidirectionalTest'
 }; //Test from ServiceNow to GitHub]]> </script>
         <sys_class_name>sys_script_include</sys_class_name>
