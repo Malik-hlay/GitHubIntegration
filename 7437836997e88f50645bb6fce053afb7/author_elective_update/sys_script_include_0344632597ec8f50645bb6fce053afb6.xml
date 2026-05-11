@@ -1,0 +1,1173 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="DELETE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_1841701_github_1.IncidentAgentCockpitAjax</api_name>
+        <caller_access/>
+        <client_callable>true</client_callable>
+        <description/>
+        <mobile_callable>false</mobile_callable>
+        <name>IncidentAgentCockpitAjax</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[// =============================================================================
+// IncidentAgentCockpitAjax — server-side endpoint for the Agent Cockpit UI Page.
+//
+// Companion to IncidentFlightDeckAjax. The Cockpit is a queue-level (multi-
+// incident) triage view: it reuses IncidentFlightDeckEngine.getDeck() only on
+// demand (when an agent expands a row) and otherwise does fast row-local
+// scoring so loading 50 incidents stays under ~1.5s.
+//
+// Performance trade-off (intentional):
+//   loadQueue()  -> _liteScore(gr) per row: priority + SLA snapshot + age +
+//                   reassignment / reopen counts + active child count.
+//   getFocus()   -> full IncidentFlightDeckEngine.getDeck() for ONE incident.
+//
+// All write methods (quickUpdate / bulkAck / bulkReassign / bulkTransition)
+// require itil and per-record canWrite().
+// =============================================================================
+
+var IncidentAgentCockpitAjax = Class.create();
+IncidentAgentCockpitAjax.prototype = Object.extendsObject(AbstractAjaxProcessor, {
+
+    MAX_ROWS: 50,
+    AT_RISK_BAR: 65,            // lite_scores.escalation >= this -> "at risk"
+    STALE_MINUTES: 240,         // 4h since last activity = stale
+    AWAITING_STATE: '3',        // "On Hold" treated as awaiting customer/info
+
+    // -------------------------------------------------------------------------
+    // Public AJAX methods
+    // -------------------------------------------------------------------------
+
+    loadQueue: function() {
+        var scope = this._trim(this.getParameter('sysparm_scope')) || 'mine';
+        var sort = this._trim(this.getParameter('sysparm_sort')) || 'urgency';
+        var filtersRaw = this.getParameter('sysparm_filters') || '';
+        var filters = this._parseFilters(filtersRaw);
+
+        var result = {
+            ok: false,
+            scope: scope,
+            sort: sort,
+            rows: [],
+            pulse: { total: 0, at_risk: 0, awaiting_customer: 0, sla_breach: 0, stale: 0 },
+            user: { name: gs.getUserDisplayName() || '', sys_id: gs.getUserID() || '' },
+            shift_started: new GlideDateTime().getDisplayValue(),
+            message: ''
+        };
+
+        if (!gs.hasRole('itil')) {
+            result.message = 'Agent Cockpit requires the itil role.';
+            return JSON.stringify(result);
+        }
+
+        var gr = new GlideRecord('incident');
+        if (!gr.isValid()) {
+            result.message = 'incident table not available.';
+            return JSON.stringify(result);
+        }
+
+        gr.addActiveQuery();
+        this._applyScope(gr, scope);
+        this._applyFilters(gr, filters);
+        this._applyOrder(gr, sort);
+        gr.setLimit(this.MAX_ROWS);
+        gr.query();
+
+        var rows = [];
+        var atRisk = 0;
+        var awaiting = 0;
+        var slaBreach = 0;
+        var stale = 0;
+        var lite;
+        var row;
+
+        while (gr.next()) {
+            lite = this._liteScore(gr);
+            row = {
+                sys_id: gr.getUniqueValue(),
+                number: gr.getValue('number') || '',
+                short_description: gr.getValue('short_description') || '',
+                priority: gr.getDisplayValue('priority') || '',
+                priority_value: gr.getValue('priority') || '',
+                state: gr.getDisplayValue('state') || '',
+                state_value: gr.getValue('state') || '',
+                category: gr.getDisplayValue('category') || '',
+                assignment_group: gr.getDisplayValue('assignment_group') || '',
+                assigned_to: gr.getDisplayValue('assigned_to') || '',
+                caller: gr.getDisplayValue('caller_id') || '',
+                opened_at: gr.getDisplayValue('opened_at') || '',
+                age_minutes: this._minutesSince(gr.getValue('opened_at')),
+                last_activity_minutes: this._minutesSince(gr.getValue('sys_updated_on')),
+                sla: lite.sla,
+                blocker_count: lite.blocker_count,
+                lite_scores: lite.scores,
+                next_action_chip: lite.next_action_chip
+            };
+
+            rows.push(row);
+
+            if (row.lite_scores.escalation >= this.AT_RISK_BAR)
+                atRisk++;
+
+            if (row.state_value === this.AWAITING_STATE)
+                awaiting++;
+
+            if (row.sla.status === 'bad')
+                slaBreach++;
+
+            if (row.last_activity_minutes >= this.STALE_MINUTES)
+                stale++;
+        }
+
+        rows = this._postSort(rows, sort);
+
+        result.rows = rows;
+        result.pulse.total = rows.length;
+        result.pulse.at_risk = atRisk;
+        result.pulse.awaiting_customer = awaiting;
+        result.pulse.sla_breach = slaBreach;
+        result.pulse.stale = stale;
+        result.ok = true;
+
+        return JSON.stringify(result);
+    },
+
+    getFocus: function() {
+        var sysId = this._trim(this.getParameter('sysparm_sys_id'));
+        var result = { ok: false, message: '' };
+
+        if (!sysId) {
+            result.message = 'sys_id is required.';
+            return JSON.stringify(result);
+        }
+
+        if (!gs.hasRole('itil')) {
+            result.message = 'Agent Cockpit requires the itil role.';
+            return JSON.stringify(result);
+        }
+
+        var deck = new IncidentFlightDeckEngine().getDeck(sysId);
+        if (!deck.ok) {
+            result.message = deck.message || 'Could not load incident deck.';
+            return JSON.stringify(result);
+        }
+
+        var summary = deck.summary || {};
+        var fixCards = deck.fix_cards || [];
+
+        result.ok = true;
+        result.sys_id = sysId;
+        result.number = (deck.incident || {}).number || '';
+        result.short_description = (deck.incident || {}).short_description || '';
+        result.summary = {
+            caller: summary.caller || '',
+            assignment_group: summary.assignment_group || '',
+            assigned_to: summary.assigned_to || '',
+            ci: summary.ci || summary.cmdb_ci || '',
+            category: summary.category || '',
+            impact: summary.impact || '',
+            urgency: summary.urgency || ''
+        };
+        result.metrics = deck.metrics || {};
+        result.next_action = deck.next_action || {};
+        result.fix_cards = fixCards.slice(0, 3);
+        result.blockers = deck.blockers || { handoff: [], resolve: [] };
+        result.sla = deck.sla || {};
+        result.last_journal = this._latestJournalEntry(sysId);
+
+        return JSON.stringify(result);
+    },
+
+    quickUpdate: function() {
+        var sysId = this._trim(this.getParameter('sysparm_sys_id'));
+        var note = this.getParameter('sysparm_note') || '';
+        return JSON.stringify(this._writeWorkNote(sysId, note));
+    },
+
+    bulkAck: function() {
+        var sysIds = this._parseSysIds(this.getParameter('sysparm_sys_ids'));
+        var note = this.getParameter('sysparm_note') || 'Acknowledged via Agent Cockpit.';
+        return JSON.stringify(this._bulkApply(sysIds, function(gr) {
+            gr.setValue('work_notes', note);
+            return true;
+        }));
+    },
+
+    bulkReassign: function() {
+        var sysIds = this._parseSysIds(this.getParameter('sysparm_sys_ids'));
+        var group = this._trim(this.getParameter('sysparm_group'));
+        var note = this.getParameter('sysparm_note') || '';
+
+        if (!group)
+            return JSON.stringify({ ok: false, message: 'Assignment group is required.', updated: 0, skipped: 0, errors: [] });
+
+        return JSON.stringify(this._bulkApply(sysIds, function(gr) {
+            gr.setValue('assignment_group', group);
+            gr.setValue('assigned_to', '');
+            if (note)
+                gr.setValue('work_notes', note);
+            return true;
+        }));
+    },
+
+    bulkTransition: function() {
+        var sysIds = this._parseSysIds(this.getParameter('sysparm_sys_ids'));
+        var state = this._trim(this.getParameter('sysparm_state'));
+        var note = this.getParameter('sysparm_note') || '';
+        var allowed = { '2': true, '3': true };  // safe transitions only: In Progress / On Hold
+
+        if (!state || !allowed[state])
+            return JSON.stringify({ ok: false, message: 'Only In Progress (2) or On Hold (3) bulk transitions are supported.', updated: 0, skipped: 0, errors: [] });
+
+        return JSON.stringify(this._bulkApply(sysIds, function(gr) {
+            gr.setValue('state', state);
+            if (note)
+                gr.setValue('work_notes', note);
+            return true;
+        }));
+    },
+
+    // -------------------------------------------------------------------------
+    // Private helpers
+    // -------------------------------------------------------------------------
+
+    _liteScore: function(gr) {
+        var engine = new IncidentFlightDeckEngine();
+        var sla = engine._getSlaSnapshot(gr);
+        var ageMin = this._minutesSince(gr.getValue('opened_at'));
+        var lastMin = this._minutesSince(gr.getValue('sys_updated_on'));
+        var priority = parseInt(gr.getValue('priority'), 10) || 4;
+        var reopen = parseInt(gr.getValue('reopen_count'), 10) || 0;
+        var reassigns = parseInt(gr.getValue('reassignment_count'), 10) || 0;
+        var blockers = this._countLiteBlockers(gr);
+        var sysId = gr.getUniqueValue();
+
+        // readiness: descriptive context populated and not stale
+        var readiness = 100;
+        if (!gr.getValue('short_description')) readiness -= 30;
+        if (!gr.getValue('cmdb_ci')) readiness -= 15;
+        if (!gr.getValue('category')) readiness -= 10;
+        if (lastMin > 240) readiness -= 15;
+        if (priority <= 2 && !gr.getValue('assigned_to')) readiness -= 25;
+        readiness = this._clamp(readiness);
+
+        // reopen risk
+        var risk = 10;
+        risk += reopen * 25;
+        risk += reassigns * 8;
+        if (sla.status === 'bad') risk += 25;
+        else if (sla.status === 'warn') risk += 10;
+        if (lastMin > 480) risk += 15;
+        risk = this._clamp(risk);
+
+        // duplicate confidence — lightweight: count active incidents on same CI
+        var dup = 0;
+        var ciId = gr.getValue('cmdb_ci');
+        if (ciId) {
+            var dupGr = new GlideRecord('incident');
+            dupGr.addQuery('cmdb_ci', ciId);
+            dupGr.addQuery('sys_id', '!=', sysId);
+            dupGr.addActiveQuery();
+            dupGr.setLimit(5);
+            dupGr.query();
+            var dupCount = 0;
+            while (dupGr.next()) dupCount++;
+            dup = Math.min(100, dupCount * 25);
+        }
+
+        // escalation probability
+        var esc = 0;
+        esc += (5 - priority) * 18;        // P1 -> +72, P4 -> +18
+        if (sla.status === 'bad') esc += 25;
+        else if (sla.status === 'warn') esc += 12;
+        if (ageMin > 720) esc += 10;
+        if (blockers > 0) esc += 8 * blockers;
+        esc = this._clamp(esc);
+
+        return {
+            sla: { label: sla.label, status: sla.status, detail: sla.detail },
+            blocker_count: blockers,
+            scores: {
+                readiness: readiness,
+                risk: risk,
+                dup: dup,
+                escalation: esc
+            },
+            next_action_chip: this._chipFor(gr, sla, esc, readiness, blockers)
+        };
+    },
+
+    _countLiteBlockers: function(gr) {
+        var n = 0;
+        if (!gr.getValue('short_description')) n++;
+        if (!gr.getValue('category')) n++;
+        if (!gr.getValue('cmdb_ci')) n++;
+        if (!gr.getValue('assigned_to') && parseInt(gr.getValue('priority'), 10) <= 2) n++;
+        return n;
+    },
+
+    _chipFor: function(gr, sla, esc, readiness, blockers) {
+        if (sla.status === 'bad')
+            return { label: 'Escalate — SLA breached', tone: 'danger' };
+        if (esc >= 80)
+            return { label: 'Escalate now', tone: 'danger' };
+        if (sla.status === 'warn')
+            return { label: 'Triage — SLA at risk', tone: 'warn' };
+        if (blockers >= 2)
+            return { label: 'Add missing context', tone: 'warn' };
+        if (readiness >= 80 && (gr.getValue('state') === '2'))
+            return { label: 'Prep handoff', tone: 'info' };
+        if (gr.getValue('state') === '1')
+            return { label: 'Acknowledge', tone: 'info' };
+        return { label: 'Continue work', tone: 'neutral' };
+    },
+
+    _applyScope: function(gr, scope) {
+        if (scope === 'group') {
+            var groups = this._userGroupIds();
+            if (groups.length)
+                gr.addQuery('assignment_group', 'IN', groups.join(','));
+            else
+                gr.addQuery('assignment_group', 'NO_RECORDS_SENTINEL');
+        } else if (scope === 'watch') {
+            gr.addQuery('watch_list', 'LIKE', gs.getUserID());
+        } else {
+            // mine (default)
+            gr.addQuery('assigned_to', gs.getUserID());
+        }
+    },
+
+    _applyFilters: function(gr, filters) {
+        if (filters.priority && filters.priority.length)
+            gr.addQuery('priority', 'IN', filters.priority.join(','));
+
+        if (filters.state && filters.state.length)
+            gr.addQuery('state', 'IN', filters.state.join(','));
+
+        if (filters.category)
+            gr.addQuery('category', filters.category);
+
+        if (filters.has_blockers === true) {
+            // narrow to "missing context" candidates without per-row blocker eval
+            var qc = gr.addQuery('short_description', '');
+            qc.addOrCondition('category', '');
+            qc.addOrCondition('cmdb_ci', '');
+        }
+
+        if (filters.awaiting === true)
+            gr.addQuery('state', this.AWAITING_STATE);
+    },
+
+    _applyOrder: function(gr, sort) {
+        // Server-side ordering for deterministic paging, then post-sort for
+        // composite sort keys (urgency / reopen risk).
+        if (sort === 'sla')
+            gr.orderBy('sys_updated_on');
+        else if (sort === 'last_activity')
+            gr.orderByDesc('sys_updated_on');
+        else if (sort === 'reopen')
+            gr.orderByDesc('reopen_count');
+        else
+            gr.orderBy('priority');
+    },
+
+    _postSort: function(rows, sort) {
+        if (sort === 'urgency') {
+            rows.sort(function(a, b) {
+                if (b.lite_scores.escalation !== a.lite_scores.escalation)
+                    return b.lite_scores.escalation - a.lite_scores.escalation;
+                return (parseInt(a.priority_value, 10) || 9) - (parseInt(b.priority_value, 10) || 9);
+            });
+        } else if (sort === 'reopen') {
+            rows.sort(function(a, b) {
+                return b.lite_scores.risk - a.lite_scores.risk;
+            });
+        } else if (sort === 'sla') {
+            var score = function(r) {
+                if (r.sla.status === 'bad') return 0;
+                if (r.sla.status === 'warn') return 1;
+                if (r.sla.status === 'ok') return 2;
+                return 3;
+            };
+            rows.sort(function(a, b) { return score(a) - score(b); });
+        }
+        return rows;
+    },
+
+    _userGroupIds: function() {
+        var ids = [];
+        var gr = new GlideRecord('sys_user_grmember');
+        gr.addQuery('user', gs.getUserID());
+        gr.query();
+        while (gr.next())
+            ids.push(gr.getValue('group'));
+        return ids;
+    },
+
+    _parseFilters: function(raw) {
+        var out = { priority: [], state: [], category: '', has_blockers: false, awaiting: false };
+        if (!raw)
+            return out;
+
+        try {
+            var parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === 'object') {
+                if (parsed.priority) out.priority = [].concat(parsed.priority);
+                if (parsed.state) out.state = [].concat(parsed.state);
+                if (parsed.category) out.category = String(parsed.category);
+                if (parsed.has_blockers === true) out.has_blockers = true;
+                if (parsed.awaiting === true) out.awaiting = true;
+            }
+        } catch (e) {
+            // ignore — return empty filters
+        }
+
+        return out;
+    },
+
+    _parseSysIds: function(raw) {
+        var out = [];
+        if (!raw)
+            return out;
+
+        var parts = String(raw).split(',');
+        var i;
+        var v;
+        for (i = 0; i < parts.length && out.length < this.MAX_ROWS; i++) {
+            v = this._trim(parts[i]);
+            if (v && /^[a-f0-9]{32}$/i.test(v))
+                out.push(v);
+        }
+        return out;
+    },
+
+    _bulkApply: function(sysIds, mutator) {
+        var result = { ok: false, updated: 0, skipped: 0, errors: [], message: '' };
+
+        if (!gs.hasRole('itil')) {
+            result.message = 'Agent Cockpit requires the itil role.';
+            return result;
+        }
+
+        if (!sysIds.length) {
+            result.message = 'No incidents selected.';
+            return result;
+        }
+
+        var i;
+        var gr;
+        for (i = 0; i < sysIds.length; i++) {
+            gr = new GlideRecord('incident');
+            if (!gr.get(sysIds[i])) {
+                result.skipped++;
+                result.errors.push({ sys_id: sysIds[i], reason: 'not found' });
+                continue;
+            }
+
+            if (!gr.canWrite()) {
+                result.skipped++;
+                result.errors.push({ sys_id: sysIds[i], reason: 'no write access' });
+                continue;
+            }
+
+            try {
+                if (mutator(gr) !== false) {
+                    gr.update();
+                    result.updated++;
+                }
+            } catch (e) {
+                result.skipped++;
+                result.errors.push({ sys_id: sysIds[i], reason: String(e) });
+            }
+        }
+
+        result.ok = result.updated > 0;
+        result.message = result.updated + ' updated, ' + result.skipped + ' skipped.';
+        return result;
+    },
+
+    _writeWorkNote: function(sysId, note) {
+        var result = { ok: false, message: '' };
+
+        if (!gs.hasRole('itil')) {
+            result.message = 'Agent Cockpit requires the itil role.';
+            return result;
+        }
+
+        if (!sysId || !note) {
+            result.message = 'sys_id and note are required.';
+            return result;
+        }
+
+        var gr = new GlideRecord('incident');
+        if (!gr.get(sysId)) {
+            result.message = 'Incident not found.';
+            return result;
+        }
+
+        if (!gr.canWrite()) {
+            result.message = 'No write access to this incident.';
+            return result;
+        }
+
+        gr.setValue('work_notes', note);
+        gr.update();
+
+        result.ok = true;
+        result.message = 'Work note added.';
+        return result;
+    },
+
+    _latestJournalEntry: function(sysId) {
+        var gr = new GlideRecord('sys_journal_field');
+        if (!gr.isValid())
+            return { author: '', when: '', text: '' };
+
+        gr.addQuery('element_id', sysId);
+        gr.addQuery('element', 'IN', 'work_notes,comments');
+        gr.orderByDesc('sys_created_on');
+        gr.setLimit(1);
+        gr.query();
+
+        if (gr.next()) {
+            return {
+                author: gr.getDisplayValue('sys_created_by') || '',
+                when: gr.getDisplayValue('sys_created_on') || '',
+                text: (gr.getValue('value') || '').substring(0, 600)
+            };
+        }
+
+        return { author: '', when: '', text: '' };
+    },
+
+    _minutesSince: function(value) {
+        if (!value)
+            return 0;
+        var then = new GlideDateTime(value);
+        var now = new GlideDateTime();
+        return Math.floor((now.getNumericValue() - then.getNumericValue()) / 60000);
+    },
+
+    _clamp: function(n) {
+        var v = parseInt(n, 10) || 0;
+        if (v < 0) return 0;
+        if (v > 100) return 100;
+        return v;
+    },
+
+    _trim: function(value) {
+        return (value || '').replace(/^\s+|\s+$/g, '');
+    },
+
+    type: 'IncidentAgentCockpitAjax'
+});]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-04-29 18:15:01</sys_created_on>
+        <sys_id>0344632597ec8f50645bb6fce053afb6</sys_id>
+        <sys_mod_count>1</sys_mod_count>
+        <sys_name>IncidentAgentCockpitAjax</sys_name>
+        <sys_package display_value="GitHub Integration" source="x_1841701_github_1">7437836997e88f50645bb6fce053afb7</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="GitHub Integration">7437836997e88f50645bb6fce053afb7</sys_scope>
+        <sys_update_name>sys_script_include_0344632597ec8f50645bb6fce053afb6</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-04-29 18:23:01</sys_updated_on>
+    </sys_script_include>
+    <sys_update_version action="INSERT_OR_UPDATE">
+        <action>DELETE</action>
+        <application display_value="GitHub Integration">7437836997e88f50645bb6fce053afb7</application>
+        <file_path/>
+        <instance_id>4b9809bd93d84f50d9f6ddd548373c6d</instance_id>
+        <instance_name>dev384001</instance_name>
+        <name>sys_script_include_0344632597ec8f50645bb6fce053afb6</name>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;&lt;sys_script_include action="INSERT_OR_UPDATE"&gt;&lt;access&gt;public&lt;/access&gt;&lt;active&gt;true&lt;/active&gt;&lt;api_name&gt;x_1841701_github_1.IncidentAgentCockpitAjax&lt;/api_name&gt;&lt;caller_access/&gt;&lt;client_callable&gt;true&lt;/client_callable&gt;&lt;description/&gt;&lt;mobile_callable&gt;false&lt;/mobile_callable&gt;&lt;name&gt;IncidentAgentCockpitAjax&lt;/name&gt;&lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;&lt;script&gt;&lt;![CDATA[// =============================================================================
+// IncidentAgentCockpitAjax — server-side endpoint for the Agent Cockpit UI Page.
+//
+// Companion to IncidentFlightDeckAjax. The Cockpit is a queue-level (multi-
+// incident) triage view: it reuses IncidentFlightDeckEngine.getDeck() only on
+// demand (when an agent expands a row) and otherwise does fast row-local
+// scoring so loading 50 incidents stays under ~1.5s.
+//
+// Performance trade-off (intentional):
+//   loadQueue()  -&gt; _liteScore(gr) per row: priority + SLA snapshot + age +
+//                   reassignment / reopen counts + active child count.
+//   getFocus()   -&gt; full IncidentFlightDeckEngine.getDeck() for ONE incident.
+//
+// All write methods (quickUpdate / bulkAck / bulkReassign / bulkTransition)
+// require itil and per-record canWrite().
+// =============================================================================
+
+var IncidentAgentCockpitAjax = Class.create();
+IncidentAgentCockpitAjax.prototype = Object.extendsObject(AbstractAjaxProcessor, {
+
+    MAX_ROWS: 50,
+    AT_RISK_BAR: 65,            // lite_scores.escalation &gt;= this -&gt; "at risk"
+    STALE_MINUTES: 240,         // 4h since last activity = stale
+    AWAITING_STATE: '3',        // "On Hold" treated as awaiting customer/info
+
+    // -------------------------------------------------------------------------
+    // Public AJAX methods
+    // -------------------------------------------------------------------------
+
+    loadQueue: function() {
+        var scope = this._trim(this.getParameter('sysparm_scope')) || 'mine';
+        var sort = this._trim(this.getParameter('sysparm_sort')) || 'urgency';
+        var filtersRaw = this.getParameter('sysparm_filters') || '';
+        var filters = this._parseFilters(filtersRaw);
+
+        var result = {
+            ok: false,
+            scope: scope,
+            sort: sort,
+            rows: [],
+            pulse: { total: 0, at_risk: 0, awaiting_customer: 0, sla_breach: 0, stale: 0 },
+            user: { name: gs.getUserDisplayName() || '', sys_id: gs.getUserID() || '' },
+            shift_started: new GlideDateTime().getDisplayValue(),
+            message: ''
+        };
+
+        if (!gs.hasRole('itil')) {
+            result.message = 'Agent Cockpit requires the itil role.';
+            return JSON.stringify(result);
+        }
+
+        var gr = new GlideRecord('incident');
+        if (!gr.isValid()) {
+            result.message = 'incident table not available.';
+            return JSON.stringify(result);
+        }
+
+        gr.addActiveQuery();
+        this._applyScope(gr, scope);
+        this._applyFilters(gr, filters);
+        this._applyOrder(gr, sort);
+        gr.setLimit(this.MAX_ROWS);
+        gr.query();
+
+        var rows = [];
+        var atRisk = 0;
+        var awaiting = 0;
+        var slaBreach = 0;
+        var stale = 0;
+        var lite;
+        var row;
+
+        while (gr.next()) {
+            lite = this._liteScore(gr);
+            row = {
+                sys_id: gr.getUniqueValue(),
+                number: gr.getValue('number') || '',
+                short_description: gr.getValue('short_description') || '',
+                priority: gr.getDisplayValue('priority') || '',
+                priority_value: gr.getValue('priority') || '',
+                state: gr.getDisplayValue('state') || '',
+                state_value: gr.getValue('state') || '',
+                category: gr.getDisplayValue('category') || '',
+                assignment_group: gr.getDisplayValue('assignment_group') || '',
+                assigned_to: gr.getDisplayValue('assigned_to') || '',
+                caller: gr.getDisplayValue('caller_id') || '',
+                opened_at: gr.getDisplayValue('opened_at') || '',
+                age_minutes: this._minutesSince(gr.getValue('opened_at')),
+                last_activity_minutes: this._minutesSince(gr.getValue('sys_updated_on')),
+                sla: lite.sla,
+                blocker_count: lite.blocker_count,
+                lite_scores: lite.scores,
+                next_action_chip: lite.next_action_chip
+            };
+
+            rows.push(row);
+
+            if (row.lite_scores.escalation &gt;= this.AT_RISK_BAR)
+                atRisk++;
+
+            if (row.state_value === this.AWAITING_STATE)
+                awaiting++;
+
+            if (row.sla.status === 'bad')
+                slaBreach++;
+
+            if (row.last_activity_minutes &gt;= this.STALE_MINUTES)
+                stale++;
+        }
+
+        rows = this._postSort(rows, sort);
+
+        result.rows = rows;
+        result.pulse.total = rows.length;
+        result.pulse.at_risk = atRisk;
+        result.pulse.awaiting_customer = awaiting;
+        result.pulse.sla_breach = slaBreach;
+        result.pulse.stale = stale;
+        result.ok = true;
+
+        return JSON.stringify(result);
+    },
+
+    getFocus: function() {
+        var sysId = this._trim(this.getParameter('sysparm_sys_id'));
+        var result = { ok: false, message: '' };
+
+        if (!sysId) {
+            result.message = 'sys_id is required.';
+            return JSON.stringify(result);
+        }
+
+        if (!gs.hasRole('itil')) {
+            result.message = 'Agent Cockpit requires the itil role.';
+            return JSON.stringify(result);
+        }
+
+        var deck = new IncidentFlightDeckEngine().getDeck(sysId);
+        if (!deck.ok) {
+            result.message = deck.message || 'Could not load incident deck.';
+            return JSON.stringify(result);
+        }
+
+        var summary = deck.summary || {};
+        var fixCards = deck.fix_cards || [];
+
+        result.ok = true;
+        result.sys_id = sysId;
+        result.number = (deck.incident || {}).number || '';
+        result.short_description = (deck.incident || {}).short_description || '';
+        result.summary = {
+            caller: summary.caller || '',
+            assignment_group: summary.assignment_group || '',
+            assigned_to: summary.assigned_to || '',
+            ci: summary.ci || summary.cmdb_ci || '',
+            category: summary.category || '',
+            impact: summary.impact || '',
+            urgency: summary.urgency || ''
+        };
+        result.metrics = deck.metrics || {};
+        result.next_action = deck.next_action || {};
+        result.fix_cards = fixCards.slice(0, 3);
+        result.blockers = deck.blockers || { handoff: [], resolve: [] };
+        result.sla = deck.sla || {};
+        result.last_journal = this._latestJournalEntry(sysId);
+
+        return JSON.stringify(result);
+    },
+
+    quickUpdate: function() {
+        var sysId = this._trim(this.getParameter('sysparm_sys_id'));
+        var note = this.getParameter('sysparm_note') || '';
+        return JSON.stringify(this._writeWorkNote(sysId, note));
+    },
+
+    bulkAck: function() {
+        var sysIds = this._parseSysIds(this.getParameter('sysparm_sys_ids'));
+        var note = this.getParameter('sysparm_note') || 'Acknowledged via Agent Cockpit.';
+        return JSON.stringify(this._bulkApply(sysIds, function(gr) {
+            gr.setValue('work_notes', note);
+            return true;
+        }));
+    },
+
+    bulkReassign: function() {
+        var sysIds = this._parseSysIds(this.getParameter('sysparm_sys_ids'));
+        var group = this._trim(this.getParameter('sysparm_group'));
+        var note = this.getParameter('sysparm_note') || '';
+
+        if (!group)
+            return JSON.stringify({ ok: false, message: 'Assignment group is required.', updated: 0, skipped: 0, errors: [] });
+
+        return JSON.stringify(this._bulkApply(sysIds, function(gr) {
+            gr.setValue('assignment_group', group);
+            gr.setValue('assigned_to', '');
+            if (note)
+                gr.setValue('work_notes', note);
+            return true;
+        }));
+    },
+
+    bulkTransition: function() {
+        var sysIds = this._parseSysIds(this.getParameter('sysparm_sys_ids'));
+        var state = this._trim(this.getParameter('sysparm_state'));
+        var note = this.getParameter('sysparm_note') || '';
+        var allowed = { '2': true, '3': true };  // safe transitions only: In Progress / On Hold
+
+        if (!state || !allowed[state])
+            return JSON.stringify({ ok: false, message: 'Only In Progress (2) or On Hold (3) bulk transitions are supported.', updated: 0, skipped: 0, errors: [] });
+
+        return JSON.stringify(this._bulkApply(sysIds, function(gr) {
+            gr.setValue('state', state);
+            if (note)
+                gr.setValue('work_notes', note);
+            return true;
+        }));
+    },
+
+    // -------------------------------------------------------------------------
+    // Private helpers
+    // -------------------------------------------------------------------------
+
+    _liteScore: function(gr) {
+        var engine = new IncidentFlightDeckEngine();
+        var sla = engine._getSlaSnapshot(gr);
+        var ageMin = this._minutesSince(gr.getValue('opened_at'));
+        var lastMin = this._minutesSince(gr.getValue('sys_updated_on'));
+        var priority = parseInt(gr.getValue('priority'), 10) || 4;
+        var reopen = parseInt(gr.getValue('reopen_count'), 10) || 0;
+        var reassigns = parseInt(gr.getValue('reassignment_count'), 10) || 0;
+        var blockers = this._countLiteBlockers(gr);
+        var sysId = gr.getUniqueValue();
+
+        // readiness: descriptive context populated and not stale
+        var readiness = 100;
+        if (!gr.getValue('short_description')) readiness -= 30;
+        if (!gr.getValue('cmdb_ci')) readiness -= 15;
+        if (!gr.getValue('category')) readiness -= 10;
+        if (lastMin &gt; 240) readiness -= 15;
+        if (priority &lt;= 2 &amp;&amp; !gr.getValue('assigned_to')) readiness -= 25;
+        readiness = this._clamp(readiness);
+
+        // reopen risk
+        var risk = 10;
+        risk += reopen * 25;
+        risk += reassigns * 8;
+        if (sla.status === 'bad') risk += 25;
+        else if (sla.status === 'warn') risk += 10;
+        if (lastMin &gt; 480) risk += 15;
+        risk = this._clamp(risk);
+
+        // duplicate confidence — lightweight: count active incidents on same CI
+        var dup = 0;
+        var ciId = gr.getValue('cmdb_ci');
+        if (ciId) {
+            var dupGr = new GlideRecord('incident');
+            dupGr.addQuery('cmdb_ci', ciId);
+            dupGr.addQuery('sys_id', '!=', sysId);
+            dupGr.addActiveQuery();
+            dupGr.setLimit(5);
+            dupGr.query();
+            var dupCount = 0;
+            while (dupGr.next()) dupCount++;
+            dup = Math.min(100, dupCount * 25);
+        }
+
+        // escalation probability
+        var esc = 0;
+        esc += (5 - priority) * 18;        // P1 -&gt; +72, P4 -&gt; +18
+        if (sla.status === 'bad') esc += 25;
+        else if (sla.status === 'warn') esc += 12;
+        if (ageMin &gt; 720) esc += 10;
+        if (blockers &gt; 0) esc += 8 * blockers;
+        esc = this._clamp(esc);
+
+        return {
+            sla: { label: sla.label, status: sla.status, detail: sla.detail },
+            blocker_count: blockers,
+            scores: {
+                readiness: readiness,
+                risk: risk,
+                dup: dup,
+                escalation: esc
+            },
+            next_action_chip: this._chipFor(gr, sla, esc, readiness, blockers)
+        };
+    },
+
+    _countLiteBlockers: function(gr) {
+        var n = 0;
+        if (!gr.getValue('short_description')) n++;
+        if (!gr.getValue('category')) n++;
+        if (!gr.getValue('cmdb_ci')) n++;
+        if (!gr.getValue('assigned_to') &amp;&amp; parseInt(gr.getValue('priority'), 10) &lt;= 2) n++;
+        return n;
+    },
+
+    _chipFor: function(gr, sla, esc, readiness, blockers) {
+        if (sla.status === 'bad')
+            return { label: 'Escalate — SLA breached', tone: 'danger' };
+        if (esc &gt;= 80)
+            return { label: 'Escalate now', tone: 'danger' };
+        if (sla.status === 'warn')
+            return { label: 'Triage — SLA at risk', tone: 'warn' };
+        if (blockers &gt;= 2)
+            return { label: 'Add missing context', tone: 'warn' };
+        if (readiness &gt;= 80 &amp;&amp; (gr.getValue('state') === '2'))
+            return { label: 'Prep handoff', tone: 'info' };
+        if (gr.getValue('state') === '1')
+            return { label: 'Acknowledge', tone: 'info' };
+        return { label: 'Continue work', tone: 'neutral' };
+    },
+
+    _applyScope: function(gr, scope) {
+        if (scope === 'group') {
+            var groups = this._userGroupIds();
+            if (groups.length)
+                gr.addQuery('assignment_group', 'IN', groups.join(','));
+            else
+                gr.addQuery('assignment_group', 'NO_RECORDS_SENTINEL');
+        } else if (scope === 'watch') {
+            gr.addQuery('watch_list', 'LIKE', gs.getUserID());
+        } else {
+            // mine (default)
+            gr.addQuery('assigned_to', gs.getUserID());
+        }
+    },
+
+    _applyFilters: function(gr, filters) {
+        if (filters.priority &amp;&amp; filters.priority.length)
+            gr.addQuery('priority', 'IN', filters.priority.join(','));
+
+        if (filters.state &amp;&amp; filters.state.length)
+            gr.addQuery('state', 'IN', filters.state.join(','));
+
+        if (filters.category)
+            gr.addQuery('category', filters.category);
+
+        if (filters.has_blockers === true) {
+            // narrow to "missing context" candidates without per-row blocker eval
+            var qc = gr.addQuery('short_description', '');
+            qc.addOrCondition('category', '');
+            qc.addOrCondition('cmdb_ci', '');
+        }
+
+        if (filters.awaiting === true)
+            gr.addQuery('state', this.AWAITING_STATE);
+    },
+
+    _applyOrder: function(gr, sort) {
+        // Server-side ordering for deterministic paging, then post-sort for
+        // composite sort keys (urgency / reopen risk).
+        if (sort === 'sla')
+            gr.orderBy('sys_updated_on');
+        else if (sort === 'last_activity')
+            gr.orderByDesc('sys_updated_on');
+        else if (sort === 'reopen')
+            gr.orderByDesc('reopen_count');
+        else
+            gr.orderBy('priority');
+    },
+
+    _postSort: function(rows, sort) {
+        if (sort === 'urgency') {
+            rows.sort(function(a, b) {
+                if (b.lite_scores.escalation !== a.lite_scores.escalation)
+                    return b.lite_scores.escalation - a.lite_scores.escalation;
+                return (parseInt(a.priority_value, 10) || 9) - (parseInt(b.priority_value, 10) || 9);
+            });
+        } else if (sort === 'reopen') {
+            rows.sort(function(a, b) {
+                return b.lite_scores.risk - a.lite_scores.risk;
+            });
+        } else if (sort === 'sla') {
+            var score = function(r) {
+                if (r.sla.status === 'bad') return 0;
+                if (r.sla.status === 'warn') return 1;
+                if (r.sla.status === 'ok') return 2;
+                return 3;
+            };
+            rows.sort(function(a, b) { return score(a) - score(b); });
+        }
+        return rows;
+    },
+
+    _userGroupIds: function() {
+        var ids = [];
+        var gr = new GlideRecord('sys_user_grmember');
+        gr.addQuery('user', gs.getUserID());
+        gr.query();
+        while (gr.next())
+            ids.push(gr.getValue('group'));
+        return ids;
+    },
+
+    _parseFilters: function(raw) {
+        var out = { priority: [], state: [], category: '', has_blockers: false, awaiting: false };
+        if (!raw)
+            return out;
+
+        try {
+            var parsed = JSON.parse(raw);
+            if (parsed &amp;&amp; typeof parsed === 'object') {
+                if (parsed.priority) out.priority = [].concat(parsed.priority);
+                if (parsed.state) out.state = [].concat(parsed.state);
+                if (parsed.category) out.category = String(parsed.category);
+                if (parsed.has_blockers === true) out.has_blockers = true;
+                if (parsed.awaiting === true) out.awaiting = true;
+            }
+        } catch (e) {
+            // ignore — return empty filters
+        }
+
+        return out;
+    },
+
+    _parseSysIds: function(raw) {
+        var out = [];
+        if (!raw)
+            return out;
+
+        var parts = String(raw).split(',');
+        var i;
+        var v;
+        for (i = 0; i &lt; parts.length &amp;&amp; out.length &lt; this.MAX_ROWS; i++) {
+            v = this._trim(parts[i]);
+            if (v &amp;&amp; /^[a-f0-9]{32}$/i.test(v))
+                out.push(v);
+        }
+        return out;
+    },
+
+    _bulkApply: function(sysIds, mutator) {
+        var result = { ok: false, updated: 0, skipped: 0, errors: [], message: '' };
+
+        if (!gs.hasRole('itil')) {
+            result.message = 'Agent Cockpit requires the itil role.';
+            return result;
+        }
+
+        if (!sysIds.length) {
+            result.message = 'No incidents selected.';
+            return result;
+        }
+
+        var i;
+        var gr;
+        for (i = 0; i &lt; sysIds.length; i++) {
+            gr = new GlideRecord('incident');
+            if (!gr.get(sysIds[i])) {
+                result.skipped++;
+                result.errors.push({ sys_id: sysIds[i], reason: 'not found' });
+                continue;
+            }
+
+            if (!gr.canWrite()) {
+                result.skipped++;
+                result.errors.push({ sys_id: sysIds[i], reason: 'no write access' });
+                continue;
+            }
+
+            try {
+                if (mutator(gr) !== false) {
+                    gr.update();
+                    result.updated++;
+                }
+            } catch (e) {
+                result.skipped++;
+                result.errors.push({ sys_id: sysIds[i], reason: String(e) });
+            }
+        }
+
+        result.ok = result.updated &gt; 0;
+        result.message = result.updated + ' updated, ' + result.skipped + ' skipped.';
+        return result;
+    },
+
+    _writeWorkNote: function(sysId, note) {
+        var result = { ok: false, message: '' };
+
+        if (!gs.hasRole('itil')) {
+            result.message = 'Agent Cockpit requires the itil role.';
+            return result;
+        }
+
+        if (!sysId || !note) {
+            result.message = 'sys_id and note are required.';
+            return result;
+        }
+
+        var gr = new GlideRecord('incident');
+        if (!gr.get(sysId)) {
+            result.message = 'Incident not found.';
+            return result;
+        }
+
+        if (!gr.canWrite()) {
+            result.message = 'No write access to this incident.';
+            return result;
+        }
+
+        gr.setValue('work_notes', note);
+        gr.update();
+
+        result.ok = true;
+        result.message = 'Work note added.';
+        return result;
+    },
+
+    _latestJournalEntry: function(sysId) {
+        var gr = new GlideRecord('sys_journal_field');
+        if (!gr.isValid())
+            return { author: '', when: '', text: '' };
+
+        gr.addQuery('element_id', sysId);
+        gr.addQuery('element', 'IN', 'work_notes,comments');
+        gr.orderByDesc('sys_created_on');
+        gr.setLimit(1);
+        gr.query();
+
+        if (gr.next()) {
+            return {
+                author: gr.getDisplayValue('sys_created_by') || '',
+                when: gr.getDisplayValue('sys_created_on') || '',
+                text: (gr.getValue('value') || '').substring(0, 600)
+            };
+        }
+
+        return { author: '', when: '', text: '' };
+    },
+
+    _minutesSince: function(value) {
+        if (!value)
+            return 0;
+        var then = new GlideDateTime(value);
+        var now = new GlideDateTime();
+        return Math.floor((now.getNumericValue() - then.getNumericValue()) / 60000);
+    },
+
+    _clamp: function(n) {
+        var v = parseInt(n, 10) || 0;
+        if (v &lt; 0) return 0;
+        if (v &gt; 100) return 100;
+        return v;
+    },
+
+    _trim: function(value) {
+        return (value || '').replace(/^\s+|\s+$/g, '');
+    },
+
+    type: 'IncidentAgentCockpitAjax'
+});]]&gt;&lt;/script&gt;&lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;&lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;&lt;sys_created_on&gt;2026-04-29 18:15:01&lt;/sys_created_on&gt;&lt;sys_id&gt;0344632597ec8f50645bb6fce053afb6&lt;/sys_id&gt;&lt;sys_mod_count&gt;1&lt;/sys_mod_count&gt;&lt;sys_name&gt;IncidentAgentCockpitAjax&lt;/sys_name&gt;&lt;sys_package display_value="GitHub Integration" source="x_1841701_github_1"&gt;7437836997e88f50645bb6fce053afb7&lt;/sys_package&gt;&lt;sys_policy&gt;read&lt;/sys_policy&gt;&lt;sys_scope display_value="GitHub Integration"&gt;7437836997e88f50645bb6fce053afb7&lt;/sys_scope&gt;&lt;sys_update_name&gt;sys_script_include_0344632597ec8f50645bb6fce053afb6&lt;/sys_update_name&gt;&lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;&lt;sys_updated_on&gt;2026-04-29 18:23:01&lt;/sys_updated_on&gt;&lt;/sys_script_include&gt;&lt;/record_update&gt;</payload>
+        <payload_hash>465267598</payload_hash>
+        <record_name>IncidentAgentCockpitAjax</record_name>
+        <reverted_from/>
+        <source>07f4e76597ec8f50645bb6fce053afc1</source>
+        <source_table>sys_update_set</source_table>
+        <state>current</state>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-04-29 18:23:01</sys_created_on>
+        <sys_id>10d6676997ec8f50645bb6fce053afbe</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_recorded_at>19dda7aea950000001</sys_recorded_at>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-04-29 18:23:01</sys_updated_on>
+        <type>Script Include</type>
+        <update_guid>10d66769afec8f50cf028d4d6e8aed72</update_guid>
+        <update_guid_history>10d66769afec8f50cf028d4d6e8aed72:465267598,97f4e765b9ec8f50095e6bae043ddeec:-1650715073</update_guid_history>
+    </sys_update_version>
+    <sys_metadata_delete action="INSERT_OR_UPDATE">
+        <sys_audit_delete/>
+        <sys_class_name>sys_metadata_delete</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-04-29 18:24:23</sys_created_on>
+        <sys_db_object display_value="" name="sys_script_include">sys_script_include</sys_db_object>
+        <sys_id>0618f8dff9b24bab906b2091cdcf05c1</sys_id>
+        <sys_metadata>0344632597ec8f50645bb6fce053afb6</sys_metadata>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>IncidentAgentCockpitAjax</sys_name>
+        <sys_package display_value="GitHub Integration" source="x_1841701_github_1">7437836997e88f50645bb6fce053afb7</sys_package>
+        <sys_parent/>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="GitHub Integration">7437836997e88f50645bb6fce053afb7</sys_scope>
+        <sys_scope_delete display_value="">7aada33ad7b54fccbcc81387840f0990</sys_scope_delete>
+        <sys_update_name>sys_script_include_0344632597ec8f50645bb6fce053afb6</sys_update_name>
+        <sys_update_version display_value="sys_script_include_0344632597ec8f50645bb6fce053afb6">10d6676997ec8f50645bb6fce053afbe</sys_update_version>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-04-29 18:24:23</sys_updated_on>
+    </sys_metadata_delete>
+</record_update>

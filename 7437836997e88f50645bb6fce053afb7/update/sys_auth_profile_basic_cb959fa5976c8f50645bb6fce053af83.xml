@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_auth_profile_basic">
+    <sys_auth_profile_basic action="INSERT_OR_UPDATE">
+        <name>ServiceNow-Integration</name>
+        <password>﷞﷟﷒1415d765976c8f50645bb6fce053afff﷬﷔1﷬﷭YgYIf_g1RVHIYysbT5XI9g==xaHofDuLYTvYN1ze7-K4A6erkKzxYTCYulYUILrfYL6-qrxAjTL6DF0k-drnB61_eqiGF4uAl_0=﷮﷯</password>
+        <sys_class_name>sys_auth_profile_basic</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-04-29 17:08:12</sys_created_on>
+        <sys_id>cb959fa5976c8f50645bb6fce053af83</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ServiceNow-Integration</sys_name>
+        <sys_package display_value="GitHub Integration" source="x_1841701_github_1">7437836997e88f50645bb6fce053afb7</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="GitHub Integration">7437836997e88f50645bb6fce053afb7</sys_scope>
+        <sys_update_name>sys_auth_profile_basic_cb959fa5976c8f50645bb6fce053af83</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-04-29 17:08:12</sys_updated_on>
+        <username>Malik-hlay</username>
+    </sys_auth_profile_basic>
+</record_update>
