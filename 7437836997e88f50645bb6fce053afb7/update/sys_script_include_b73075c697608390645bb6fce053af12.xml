@@ -15,18 +15,19 @@ BidirectionalTest.prototype = {
     },
 //Updated FROM GITHUB - Bidirectiional Test Proof
     type: 'BidirectionalTest'
-}; //Test from ServiceNow to GitHub]]> </script>
+}; //Test from ServiceNow to GitHub
+//test now]]></script>
         <sys_class_name>sys_script_include</sys_class_name>
         <sys_created_by>admin</sys_created_by>
         <sys_created_on>2026-04-30 23:02:35</sys_created_on>
         <sys_id>b73075c697608390645bb6fce053af12</sys_id>
-        <sys_mod_count>0</sys_mod_count>
+        <sys_mod_count>1</sys_mod_count>
         <sys_name>BidirectionalTest</sys_name>
         <sys_package display_value="GitHub Integration" source="x_1841701_github_1">7437836997e88f50645bb6fce053afb7</sys_package>
         <sys_policy>read</sys_policy>
         <sys_scope display_value="GitHub Integration">7437836997e88f50645bb6fce053afb7</sys_scope>
         <sys_update_name>sys_script_include_b73075c697608390645bb6fce053af12</sys_update_name>
         <sys_updated_by>admin</sys_updated_by>
-        <sys_updated_on>2026-04-30 23:02:35</sys_updated_on>
+        <sys_updated_on>2026-05-11 15:26:49</sys_updated_on>
     </sys_script_include>
 </record_update>
